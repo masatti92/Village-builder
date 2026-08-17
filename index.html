@@ -608,6 +608,8 @@ const ONLINE_LOCAL_ONLY_KEYS = [
   'onlineGuestName','onlineGuestProf','onlineError','onlineJoinCodeInput','cpuActionText','vsComputer','cpuPlayerIdx'
 ];
 
+const APP_VERSION = 'v2026.08.17-1';
+
 const RESOURCE_TYPES = ['wood','stone','wheat','wool'];
 const RES_ICON = {wood:'🌲', stone:'🪨', wheat:'🌾', wool:'🐏'};
 const RES_NAME = {wood:'木', stone:'石', wheat:'麦', wool:'羊毛'};
@@ -1043,6 +1045,7 @@ function freshState(){
     setupStep:0,
     rouletteWinner:null,
     vsComputer:false,
+    cpuStrategy:null,
     cpuPlayerIdx:null,
     tourOpen:false,
     tourStep:0,
@@ -1208,6 +1211,8 @@ function setCpuOpponent(){
   const profKeys = Object.keys(PROFESSIONS);
   state.setupProf[1] = profKeys[Math.floor(Math.random()*profKeys.length)];
   state.vsComputer = true;
+  const strategies = ['economy', 'rush', 'goldhunter'];
+  state.cpuStrategy = strategies[Math.floor(Math.random()*strategies.length)];
   state.setupError = null;
   state.setupStep = 2;
   render();
@@ -1516,6 +1521,7 @@ function finalizeStartGame(){
   const names = state.setupNames;
   const profs = state.setupProf;
   const vsComputer = state.vsComputer;
+  const cpuStrategy = state.cpuStrategy;
   const winnerIdx = state.rouletteWinner;
   const loserIdx = 1 - winnerIdx;
   const winnerName = names[winnerIdx];
@@ -1524,6 +1530,7 @@ function finalizeStartGame(){
   const loserProf = profs[loserIdx];
   state = freshState();
   state.vsComputer = vsComputer;
+  state.cpuStrategy = cpuStrategy;
   state.players[0] = newPlayer(winnerName);
   state.players[1] = newPlayer(loserName);
   state.cpuPlayerIdx = vsComputer ? (winnerName==='CPU' ? 0 : 1) : null;
@@ -1617,17 +1624,75 @@ function scheduleCpuTurn(){
   if(!state.vsComputer || state.cpuPlayerIdx===null || state.current!==state.cpuPlayerIdx || state.phase!=='playing') return;
   setTimeout(runCpuTurn, 1300);
 }
-function pickCpuBuildCell(playerIdx){
-  const p = state.players[playerIdx];
-  const goldWeight = p.profession==='explorer' ? 6 : 4;
-  let bestIdx = -1, bestScore = -1;
+function pickCpuBuildCell(playerIdx, avoidFog){
+  const monumentCells = monumentCellsOf(playerIdx);
+  function monumentClusterBonus(i){
+    if(monumentCells.length===0) return 0;
+    const neighborhood = [...neighborIndices(i), ...diagonalIndices(i)];
+    return monumentCells.some(m => neighborhood.includes(m)) ? 3 : 0;
+  }
+  let bestIdx = -1;
+  let bestIsGold = false;
+  let bestNotFog = false;
+  let bestAdjacency = -1;
   for(let i=0;i<BOARD_SIZE;i++){
     if(state.board[i]) continue;
     if(state.specialTiles[i]==='rock') continue;
-    const score = countOwnNeighbors(i, playerIdx) + (state.specialTiles[i]==='gold' ? goldWeight : 0);
-    if(score > bestScore){ bestScore = score; bestIdx = i; }
+    const isGold = state.specialTiles[i]==='gold';
+    const isFog = state.specialTiles[i]==='fog';
+    const notFog = !isFog;
+    const adjacency = countOwnNeighbors(i, playerIdx) + monumentClusterBonus(i);
+    // tier 1: gold tiles always beat non-gold tiles, no matter the adjacency
+    if(isGold && !bestIsGold){
+      bestIdx = i; bestIsGold = true; bestNotFog = notFog; bestAdjacency = adjacency;
+      continue;
+    }
+    if(!isGold && bestIsGold) continue;
+    if(avoidFog){
+      // tier 2: within the same gold-status tier, avoid fog when a non-fog option exists
+      if(notFog && !bestNotFog){
+        bestIdx = i; bestIsGold = isGold; bestNotFog = true; bestAdjacency = adjacency;
+        continue;
+      }
+      if(!notFog && bestNotFog) continue;
+    }
+    // tier 3: higher adjacency wins (includes a bonus for clustering near own monuments)
+    if(adjacency > bestAdjacency){
+      bestIdx = i; bestIsGold = isGold; bestNotFog = notFog; bestAdjacency = adjacency;
+    }
   }
   return bestIdx;
+}
+function pickCpuBuildCellForMonument(playerIdx){
+  // monument itself benefits from diagonal counting too, so favor cells with existing diagonal neighbors
+  let bestIdx = -1;
+  let bestIsGold = false;
+  let bestScore = -1;
+  for(let i=0;i<BOARD_SIZE;i++){
+    if(state.board[i]) continue;
+    if(state.specialTiles[i]==='rock') continue;
+    const isGold = state.specialTiles[i]==='gold';
+    const ortho = neighborIndices(i).filter(n => state.board[n] && state.board[n].player===playerIdx).length;
+    const diag = diagonalIndices(i).filter(n => state.board[n] && state.board[n].player===playerIdx).length;
+    const score = ortho + diag;
+    if(isGold && !bestIsGold){ bestIdx = i; bestIsGold = true; bestScore = score; continue; }
+    if(!isGold && bestIsGold) continue;
+    if(score > bestScore){ bestIdx = i; bestIsGold = isGold; bestScore = score; }
+  }
+  return bestIdx;
+}
+function pickCpuBuildCellForFort(playerIdx, enemyIdx){
+  // fort steals resources based on adjacent enemy buildings, so favor cells next to the opponent
+  let bestIdx = -1;
+  let bestEnemyAdj = -1;
+  for(let i=0;i<BOARD_SIZE;i++){
+    if(state.board[i]) continue;
+    if(state.specialTiles[i]==='rock') continue;
+    const enemyAdj = neighborIndices(i).filter(n => state.board[n] && state.board[n].player===enemyIdx).length;
+    if(enemyAdj > bestEnemyAdj){ bestIdx = i; bestEnemyAdj = enemyAdj; }
+  }
+  if(bestEnemyAdj > 0) return bestIdx;
+  return pickCpuBuildCell(playerIdx, true); // no enemy neighbors available, fall back to normal placement
 }
 function findCpuExchangeTarget(p){
   const allBuildings = [];
@@ -1639,6 +1704,7 @@ function findCpuExchangeTarget(p){
     allBuildings.push({cost: PRODUCTION_BUILDINGS[key].cost, priority: 1});
   }
   let best = null;
+  let canAlreadyBuildSomething = false;
   for(const b of allBuildings){
     let deficit = 0;
     let neededType = null;
@@ -1649,11 +1715,13 @@ function findCpuExchangeTarget(p){
         if(!neededType || need > (b.cost[neededType]||0) - p.resources[neededType]) neededType = t;
       }
     }
-    if(deficit === 0 || deficit > 1) continue; // only chase targets exactly 1 resource away (reachable via a single 3-for-1 exchange)
+    if(deficit === 0){ canAlreadyBuildSomething = true; continue; }
+    if(deficit > 1) continue; // only chase targets exactly 1 resource away (reachable via a single 3-for-1 exchange)
     if(!neededType) continue;
     if(!best || b.priority > best.priority) best = {receiveType: neededType, priority: b.priority, cost: b.cost};
   }
   if(!best){
+    if(canAlreadyBuildSomething) return null; // no need to exchange, something is already affordable right now
     const sorted = [...RESOURCE_TYPES].sort((a,b)=>p.resources[b]-p.resources[a]);
     const giveType = sorted[0];
     const receiveType = sorted[sorted.length-1];
@@ -1674,43 +1742,99 @@ function runCpuTurn(){
   const cpuIdx = state.cpuPlayerIdx;
   const p = state.players[cpuIdx];
   state.cpuActionText = null;
+  const exchangesDone = [];
 
+  // exchange phase first, so a merchant CPU can use both of its exchanges to set up a build
+  while(state.exchangeCount < exchangeLimit(p)){
+    const target = findCpuExchangeTarget(p);
+    if(!target) break;
+    state.exchangeGiveSelected = {wood:0, stone:0, wheat:0, wool:0};
+    state.exchangeGiveSelected[target.giveType] = 3;
+    pickReceive(target.receiveType);
+    exchangesDone.push(target);
+  }
+
+  if(exchangesDone.length>0){
+    const last = exchangesDone[exchangesDone.length-1];
+    const countNote = exchangesDone.length>1 ? `(${exchangesDone.length}回)` : '';
+    state.cpuActionText = `🔄 ${RES_ICON[last.giveType]}3個を${RES_ICON[last.receiveType]}1個に交換しました${countNote}`;
+    render();
+    setTimeout(()=>continueCpuTurnAfterExchange(cpuIdx, exchangesDone), 1300);
+  } else {
+    continueCpuTurnAfterExchange(cpuIdx, exchangesDone);
+  }
+}
+function continueCpuTurnAfterExchange(cpuIdx, exchangesDone){
+  const p = state.players[cpuIdx];
   let buildDecision = null; // {key, isProduction, cellIdx, emoji, name}
   if(!state.actionUsed){
+    const humanIdx = 1 - cpuIdx;
+    const economyThreshold = state.cpuStrategy==='economy' ? 4 : state.cpuStrategy==='rush' ? 1 : 3;
     const ownedProductionCount = state.board.filter(c => c && c.player===cpuIdx && c.isProduction).length;
-    const needsEconomy = ownedProductionCount < 3;
+    const turnsRemaining = MAX_TURNS - p.turnsPlayed;
+    const needsEconomy = ownedProductionCount < economyThreshold && turnsRemaining > 3;
+
+    function pickFromTop(list){
+      if(list.length===0) return null;
+      const top = list.slice(0, Math.min(3, list.length));
+      return top[Math.floor(Math.random()*top.length)];
+    }
 
     function tryPointBuildings(){
       const candidates = [];
+      const seasonTurn = p.turnsPlayed % TURNS_PER_SEASON;
+      const taxComingSoon = seasonTurn === TURNS_PER_SEASON - 1; // about to hit a tax boundary
       for(const key in POINT_BUILDINGS){
         const supply = state.buildingSupply[key];
         if(supply <= 0) continue;
         const {cost} = computeCost(key, false, p);
         const affordable = Object.keys(cost).every(t => p.resources[t] >= cost[t]);
         if(affordable){
-          const scarceBonus = supply <= 2 ? 5 : 0;
-          candidates.push({key, priority: POINT_BUILDINGS[key].points + scarceBonus});
+          let scarceBonus = supply <= 2 ? 5 : 0;
+          if(supply <= 2){
+            const humanOwnsThis = state.board.some(c => c && c.player===humanIdx && !c.isProduction && c.building===key);
+            if(humanOwnsThis) scarceBonus += 6; // react: opponent already grabbed one, hurry for the rest
+          }
+          let strategicBonus = (key==='bank' || key==='fort') ? 3 : 0;
+          if(key==='bank' && taxComingSoon) strategicBonus += 6; // build the bank right before tax hits
+          const totalAfterPurchase = RESOURCE_TYPES.reduce((s,t) => s + p.resources[t] - (cost[t]||0), 0);
+          const wouldDeplete = totalAfterPurchase < 2 && ownedProductionCount < 3 && turnsRemaining > 1;
+          if(wouldDeplete) continue; // safety: don't leave the CPU with nothing to work with before it has income
+          const taxReserveNeeded = (taxComingSoon && key!=='bank' && ownedProductionCount < 2) ? TAX_AMOUNT : 0;
+          if(totalAfterPurchase < taxReserveNeeded) continue; // safety: keep enough to cover next turn's tax
+          candidates.push({key, priority: POINT_BUILDINGS[key].points + scarceBonus + strategicBonus});
         }
       }
       candidates.sort((a,b)=>b.priority-a.priority);
-      if(candidates.length>0){
-        const cellIdx = pickCpuBuildCell(cpuIdx);
+      const chosen = pickFromTop(candidates);
+      if(chosen){
+        const key = chosen.key;
+        let cellIdx;
+        if(key==='monument') cellIdx = pickCpuBuildCellForMonument(cpuIdx);
+        else if(key==='fort') cellIdx = pickCpuBuildCellForFort(cpuIdx, humanIdx);
+        else cellIdx = pickCpuBuildCell(cpuIdx, true); // avoid fog for point buildings
         if(cellIdx!==-1){
-          const key = candidates[0].key;
           return {key, isProduction:false, cellIdx, emoji:POINT_BUILDINGS[key].emoji, name:POINT_BUILDINGS[key].name};
         }
       }
       return null;
     }
     function tryProductionBuildings(){
+      const candidates = [];
       for(const key in PRODUCTION_BUILDINGS){
         const {cost} = computeCost(key, true, p);
         const affordable = Object.keys(cost).every(t => p.resources[t] >= cost[t]);
         if(affordable){
-          const cellIdx = pickCpuBuildCell(cpuIdx);
-          if(cellIdx!==-1){
-            return {key, isProduction:true, cellIdx, emoji:PRODUCTION_BUILDINGS[key].emoji, name:PRODUCTION_BUILDINGS[key].name};
-          }
+          const outputCount = Object.keys(PRODUCTION_BUILDINGS[key].produces).length;
+          candidates.push({key, priority: outputCount});
+        }
+      }
+      candidates.sort((a,b)=>b.priority-a.priority);
+      const chosen = pickFromTop(candidates);
+      if(chosen){
+        const cellIdx = pickCpuBuildCell(cpuIdx);
+        if(cellIdx!==-1){
+          return {key:chosen.key, isProduction:true, cellIdx, emoji:PRODUCTION_BUILDINGS[chosen.key].emoji, name:PRODUCTION_BUILDINGS[chosen.key].name};
         }
       }
       return null;
@@ -1736,18 +1860,7 @@ function runCpuTurn(){
     return;
   }
 
-  let exchanged = false;
-  if(state.exchangeCount < exchangeLimit(p)){
-    const target = findCpuExchangeTarget(p);
-    if(target){
-      state.exchangeGiveSelected = {wood:0, stone:0, wheat:0, wool:0};
-      state.exchangeGiveSelected[target.giveType] = 3;
-      pickReceive(target.receiveType);
-      exchanged = true;
-      state.cpuActionText = `🔄 ${RES_ICON[target.giveType]}3個を${RES_ICON[target.receiveType]}1個に交換しました`;
-    }
-  }
-  if(!exchanged){
+  if(exchangesDone.length===0){
     state.cpuActionText = `🤔 今回は何もせず、ターンを終了します`;
   }
   render();
@@ -2026,10 +2139,30 @@ function processNextTaxPlayer(){
     addLog(`💰 ${p.name}は最後の税金として ${paidParts} を納めた${discountNote}`);
     state.taxResults.push({type:'paid', playerIdx, paid, discount});
     processNextTaxPlayer();
+  } else if(state.vsComputer && playerIdx===state.cpuPlayerIdx){
+    const paid = autoPayCpuTax(p, dueAmount);
+    const paidParts = RESOURCE_TYPES.filter(t=>paid[t]>0).map(t=>`${RES_ICON[t]}-${paid[t]}`).join(' ');
+    const discountNote = discount>0 ? `（🏦銀行で${discount}個軽減）` : '';
+    addLog(`💰 ${p.name}は税金として ${paidParts} を納めた${discountNote}`);
+    state.taxResults.push({type:'paid', playerIdx, paid, discount});
+    processNextTaxPlayer();
   } else {
     state.taxPaymentUI = {playerIdx, dueAmount, discount, selected:{wood:0,stone:0,wheat:0,wool:0}};
     render();
   }
+}
+function autoPayCpuTax(p, dueAmount){
+  const paid = {wood:0, stone:0, wheat:0, wool:0};
+  let remaining = dueAmount;
+  const sorted = [...RESOURCE_TYPES].sort((a,b)=>p.resources[b]-p.resources[a]);
+  for(const t of sorted){
+    if(remaining<=0) break;
+    const take = Math.min(p.resources[t], remaining);
+    paid[t] = take;
+    p.resources[t] -= take;
+    remaining -= take;
+  }
+  return paid;
 }
 function pickTaxResource(type){
   const ui = state.taxPaymentUI;
@@ -2361,6 +2494,7 @@ function renderSetup(){
         <button class="wood-btn wide" style="margin-top:8px;" onclick="openTour()">🧭 チュートリアル</button>
         <button class="wood-btn small" style="margin-top:8px;" onclick="startTestGame()">🧪 テスト版(すぐ盤面へ)</button>
         <button class="wood-btn small" style="margin-top:8px;" onclick="toggleTutorial()">📖 くわしいあそびかたを見る</button>
+        <div style="font-size:9px; color:var(--parchment-dark); text-align:center; margin-top:10px; opacity:.6;">${APP_VERSION}</div>
       </div>
     `;
   }
