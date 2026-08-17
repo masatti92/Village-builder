@@ -1061,6 +1061,7 @@ function freshState(){
     onlineGuestProf:null,
     onlineError:null,
     onlineJoinCodeInput:'',
+    onlineOpponentActionText:null,
     startBonusCelebration:null,
     showTutorial:false,
     tutorialTab:'goal',
@@ -1211,7 +1212,7 @@ function setCpuOpponent(){
   const profKeys = Object.keys(PROFESSIONS);
   state.setupProf[1] = profKeys[Math.floor(Math.random()*profKeys.length)];
   state.vsComputer = true;
-  const strategies = ['economy', 'rush', 'goldhunter'];
+  const strategies = ['economy', 'goldhunter'];
   state.cpuStrategy = strategies[Math.floor(Math.random()*strategies.length)];
   state.setupError = null;
   state.setupStep = 2;
@@ -1424,12 +1425,38 @@ async function startOnlineGameAsHost(remote){
   await pushGameStateNow();
 }
 function applyRemoteGameState(remote){
+  const oldBoard = state.board ? state.board.slice() : [];
+  const oldCurrent = state.current;
   const localOnly = {};
   ONLINE_LOCAL_ONLY_KEYS.forEach(k => { localOnly[k] = state[k]; });
   Object.assign(state, remote);
   Object.assign(state, localOnly);
   state.onlineMode = true;
   lastPushedStateJSON = JSON.stringify(getSyncableState());
+
+  // detect what the opponent did by diffing the board, so the other player can see it clearly
+  if(state.myPlayerIdx!==null && oldBoard.length===state.board.length){
+    let newBuildIdx = -1;
+    for(let i=0;i<state.board.length;i++){
+      if(!oldBoard[i] && state.board[i] && state.board[i].player!==state.myPlayerIdx){
+        newBuildIdx = i;
+        break;
+      }
+    }
+    if(newBuildIdx!==-1){
+      const c = state.board[newBuildIdx];
+      const b = c.isProduction ? PRODUCTION_BUILDINGS[c.building] : POINT_BUILDINGS[c.building];
+      const opponentName = state.players[c.player].name;
+      state.onlineOpponentActionText = `🌐 ${opponentName}が${b.emoji}${b.name}を建てました！`;
+    } else if(oldCurrent===state.myPlayerIdx && state.current!==state.myPlayerIdx){
+      const opponentIdx = 1 - state.myPlayerIdx;
+      state.onlineOpponentActionText = `🌐 ${state.players[opponentIdx].name}のターンが終わりました`;
+    }
+    if(state.onlineOpponentActionText){
+      clearTimeout(window.__onlineActionTimer);
+      window.__onlineActionTimer = setTimeout(()=>{ state.onlineOpponentActionText = null; render(); }, 3500);
+    }
+  }
   render();
 }
 function getSyncableState(){
@@ -1769,10 +1796,12 @@ function continueCpuTurnAfterExchange(cpuIdx, exchangesDone){
   let buildDecision = null; // {key, isProduction, cellIdx, emoji, name}
   if(!state.actionUsed){
     const humanIdx = 1 - cpuIdx;
-    const economyThreshold = state.cpuStrategy==='economy' ? 4 : state.cpuStrategy==='rush' ? 1 : 3;
+    const economyThreshold = state.cpuStrategy==='economy' ? 4 : 3;
     const ownedProductionCount = state.board.filter(c => c && c.player===cpuIdx && c.isProduction).length;
     const turnsRemaining = MAX_TURNS - p.turnsPlayed;
-    const needsEconomy = ownedProductionCount < economyThreshold && turnsRemaining > 3;
+    const totalResources = RESOURCE_TYPES.reduce((s,t) => s + p.resources[t], 0);
+    const runningDry = totalResources < 3 && ownedProductionCount < 4 && turnsRemaining > 2;
+    const needsEconomy = (ownedProductionCount < economyThreshold && turnsRemaining > 3) || runningDry;
 
     function pickFromTop(list){
       if(list.length===0) return null;
@@ -2494,7 +2523,7 @@ function renderSetup(){
         <button class="wood-btn wide" style="margin-top:8px;" onclick="openTour()">🧭 チュートリアル</button>
         <button class="wood-btn small" style="margin-top:8px;" onclick="startTestGame()">🧪 テスト版(すぐ盤面へ)</button>
         <button class="wood-btn small" style="margin-top:8px;" onclick="toggleTutorial()">📖 くわしいあそびかたを見る</button>
-        <div style="font-size:9px; color:var(--parchment-dark); text-align:center; margin-top:10px; opacity:.6;">${APP_VERSION}</div>
+        <div style="font-size:11px; font-weight:700; color:var(--gold); text-align:center; margin-top:10px;">${APP_VERSION}</div>
       </div>
     `;
   }
@@ -2782,6 +2811,7 @@ function renderPlaying(){
       </div>
       ${renderScoreCard(1)}
     </div>
+    ${state.onlineMode && state.onlineOpponentActionText ? `<div class="cpu-thinking decided" style="margin-bottom:8px;">${state.onlineOpponentActionText}</div>` : ''}
     <div class="play-controls">
       ${(state.vsComputer && state.current===state.cpuPlayerIdx) ? `
         <div class="cpu-thinking ${state.cpuActionText ? 'decided' : ''}">${state.cpuActionText ? state.cpuActionText : `🤖 ${p.name}が考え中...`}</div>
