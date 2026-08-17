@@ -1618,14 +1618,55 @@ function scheduleCpuTurn(){
   setTimeout(runCpuTurn, 1300);
 }
 function pickCpuBuildCell(playerIdx){
+  const p = state.players[playerIdx];
+  const goldWeight = p.profession==='explorer' ? 6 : 4;
   let bestIdx = -1, bestScore = -1;
   for(let i=0;i<BOARD_SIZE;i++){
     if(state.board[i]) continue;
     if(state.specialTiles[i]==='rock') continue;
-    const score = countOwnNeighbors(i, playerIdx) + (state.specialTiles[i]==='gold' ? 2 : 0);
+    const score = countOwnNeighbors(i, playerIdx) + (state.specialTiles[i]==='gold' ? goldWeight : 0);
     if(score > bestScore){ bestScore = score; bestIdx = i; }
   }
   return bestIdx;
+}
+function findCpuExchangeTarget(p){
+  const allBuildings = [];
+  for(const key in POINT_BUILDINGS){
+    if(state.buildingSupply[key] <= 0) continue;
+    allBuildings.push({cost: POINT_BUILDINGS[key].cost, priority: POINT_BUILDINGS[key].points + (state.buildingSupply[key]<=2 ? 5 : 0)});
+  }
+  for(const key in PRODUCTION_BUILDINGS){
+    allBuildings.push({cost: PRODUCTION_BUILDINGS[key].cost, priority: 1});
+  }
+  let best = null;
+  for(const b of allBuildings){
+    let deficit = 0;
+    let neededType = null;
+    for(const t of RESOURCE_TYPES){
+      const need = (b.cost[t]||0) - p.resources[t];
+      if(need > 0){
+        deficit += need;
+        if(!neededType || need > (b.cost[neededType]||0) - p.resources[neededType]) neededType = t;
+      }
+    }
+    if(deficit === 0 || deficit > 1) continue; // only chase targets exactly 1 resource away (reachable via a single 3-for-1 exchange)
+    if(!neededType) continue;
+    if(!best || b.priority > best.priority) best = {receiveType: neededType, priority: b.priority, cost: b.cost};
+  }
+  if(!best){
+    const sorted = [...RESOURCE_TYPES].sort((a,b)=>p.resources[b]-p.resources[a]);
+    const giveType = sorted[0];
+    const receiveType = sorted[sorted.length-1];
+    if(p.resources[giveType] >= 3 && giveType !== receiveType){
+      return {giveType, receiveType};
+    }
+    return null;
+  }
+  const giveCandidates = [...RESOURCE_TYPES]
+    .filter(t => t !== best.receiveType && p.resources[t] >= 3)
+    .sort((a,b) => p.resources[b]-p.resources[a]);
+  if(giveCandidates.length===0) return null;
+  return {giveType: giveCandidates[0], receiveType: best.receiveType};
 }
 function runCpuTurn(){
   if(!state.vsComputer || state.cpuPlayerIdx===null || state.current!==state.cpuPlayerIdx || state.phase!=='playing') return;
@@ -1636,33 +1677,49 @@ function runCpuTurn(){
 
   let buildDecision = null; // {key, isProduction, cellIdx, emoji, name}
   if(!state.actionUsed){
-    const candidates = [];
-    for(const key in POINT_BUILDINGS){
-      if(state.buildingSupply[key] <= 0) continue;
-      const {cost} = computeCost(key, false, p);
-      const affordable = Object.keys(cost).every(t => p.resources[t] >= cost[t]);
-      if(affordable) candidates.push({key, points: POINT_BUILDINGS[key].points});
-    }
-    candidates.sort((a,b)=>b.points-a.points);
-    if(candidates.length>0){
-      const cellIdx = pickCpuBuildCell(cpuIdx);
-      if(cellIdx!==-1){
-        const key = candidates[0].key;
-        buildDecision = {key, isProduction:false, cellIdx, emoji:POINT_BUILDINGS[key].emoji, name:POINT_BUILDINGS[key].name};
+    const ownedProductionCount = state.board.filter(c => c && c.player===cpuIdx && c.isProduction).length;
+    const needsEconomy = ownedProductionCount < 3;
+
+    function tryPointBuildings(){
+      const candidates = [];
+      for(const key in POINT_BUILDINGS){
+        const supply = state.buildingSupply[key];
+        if(supply <= 0) continue;
+        const {cost} = computeCost(key, false, p);
+        const affordable = Object.keys(cost).every(t => p.resources[t] >= cost[t]);
+        if(affordable){
+          const scarceBonus = supply <= 2 ? 5 : 0;
+          candidates.push({key, priority: POINT_BUILDINGS[key].points + scarceBonus});
+        }
       }
+      candidates.sort((a,b)=>b.priority-a.priority);
+      if(candidates.length>0){
+        const cellIdx = pickCpuBuildCell(cpuIdx);
+        if(cellIdx!==-1){
+          const key = candidates[0].key;
+          return {key, isProduction:false, cellIdx, emoji:POINT_BUILDINGS[key].emoji, name:POINT_BUILDINGS[key].name};
+        }
+      }
+      return null;
     }
-    if(!buildDecision){
+    function tryProductionBuildings(){
       for(const key in PRODUCTION_BUILDINGS){
         const {cost} = computeCost(key, true, p);
         const affordable = Object.keys(cost).every(t => p.resources[t] >= cost[t]);
         if(affordable){
           const cellIdx = pickCpuBuildCell(cpuIdx);
           if(cellIdx!==-1){
-            buildDecision = {key, isProduction:true, cellIdx, emoji:PRODUCTION_BUILDINGS[key].emoji, name:PRODUCTION_BUILDINGS[key].name};
-            break;
+            return {key, isProduction:true, cellIdx, emoji:PRODUCTION_BUILDINGS[key].emoji, name:PRODUCTION_BUILDINGS[key].name};
           }
         }
       }
+      return null;
+    }
+
+    if(needsEconomy){
+      buildDecision = tryProductionBuildings() || tryPointBuildings();
+    } else {
+      buildDecision = tryPointBuildings() || tryProductionBuildings();
     }
   }
 
@@ -1681,15 +1738,13 @@ function runCpuTurn(){
 
   let exchanged = false;
   if(state.exchangeCount < exchangeLimit(p)){
-    const sorted = [...RESOURCE_TYPES].sort((a,b)=>p.resources[b]-p.resources[a]);
-    const giveType = sorted[0];
-    const receiveType = sorted[sorted.length-1];
-    if(p.resources[giveType] >= 3 && giveType !== receiveType){
+    const target = findCpuExchangeTarget(p);
+    if(target){
       state.exchangeGiveSelected = {wood:0, stone:0, wheat:0, wool:0};
-      state.exchangeGiveSelected[giveType] = 3;
-      pickReceive(receiveType);
+      state.exchangeGiveSelected[target.giveType] = 3;
+      pickReceive(target.receiveType);
       exchanged = true;
-      state.cpuActionText = `🔄 ${RES_ICON[giveType]}3個を${RES_ICON[receiveType]}1個に交換しました`;
+      state.cpuActionText = `🔄 ${RES_ICON[target.giveType]}3個を${RES_ICON[target.receiveType]}1個に交換しました`;
     }
   }
   if(!exchanged){
