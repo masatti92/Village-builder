@@ -608,7 +608,7 @@ const ONLINE_LOCAL_ONLY_KEYS = [
   'onlineGuestName','onlineGuestProf','onlineError','onlineJoinCodeInput','cpuActionText','vsComputer','cpuPlayerIdx'
 ];
 
-const APP_VERSION = 'v2026.08.17-1';
+const APP_VERSION = 'v2026.08.17-4';
 
 const RESOURCE_TYPES = ['wood','stone','wheat','wool'];
 const RES_ICON = {wood:'🌲', stone:'🪨', wheat:'🌾', wool:'🐏'};
@@ -1061,6 +1061,7 @@ function freshState(){
     onlineGuestProf:null,
     onlineError:null,
     onlineJoinCodeInput:'',
+    onlineOpponentActionText:null,
     startBonusCelebration:null,
     showTutorial:false,
     tutorialTab:'goal',
@@ -1211,7 +1212,7 @@ function setCpuOpponent(){
   const profKeys = Object.keys(PROFESSIONS);
   state.setupProf[1] = profKeys[Math.floor(Math.random()*profKeys.length)];
   state.vsComputer = true;
-  const strategies = ['economy', 'rush', 'goldhunter'];
+  const strategies = ['economy', 'goldhunter'];
   state.cpuStrategy = strategies[Math.floor(Math.random()*strategies.length)];
   state.setupError = null;
   state.setupStep = 2;
@@ -1424,12 +1425,38 @@ async function startOnlineGameAsHost(remote){
   await pushGameStateNow();
 }
 function applyRemoteGameState(remote){
+  const oldBoard = state.board ? state.board.slice() : [];
+  const oldCurrent = state.current;
   const localOnly = {};
   ONLINE_LOCAL_ONLY_KEYS.forEach(k => { localOnly[k] = state[k]; });
   Object.assign(state, remote);
   Object.assign(state, localOnly);
   state.onlineMode = true;
   lastPushedStateJSON = JSON.stringify(getSyncableState());
+
+  // detect what the opponent did by diffing the board, so the other player can see it clearly
+  if(state.myPlayerIdx!==null && oldBoard.length===state.board.length){
+    let newBuildIdx = -1;
+    for(let i=0;i<state.board.length;i++){
+      if(!oldBoard[i] && state.board[i] && state.board[i].player!==state.myPlayerIdx){
+        newBuildIdx = i;
+        break;
+      }
+    }
+    if(newBuildIdx!==-1){
+      const c = state.board[newBuildIdx];
+      const b = c.isProduction ? PRODUCTION_BUILDINGS[c.building] : POINT_BUILDINGS[c.building];
+      const opponentName = state.players[c.player].name;
+      state.onlineOpponentActionText = `🌐 ${opponentName}が${b.emoji}${b.name}を建てました！`;
+    } else if(oldCurrent===state.myPlayerIdx && state.current!==state.myPlayerIdx){
+      const opponentIdx = 1 - state.myPlayerIdx;
+      state.onlineOpponentActionText = `🌐 ${state.players[opponentIdx].name}のターンが終わりました`;
+    }
+    if(state.onlineOpponentActionText){
+      clearTimeout(window.__onlineActionTimer);
+      window.__onlineActionTimer = setTimeout(()=>{ state.onlineOpponentActionText = null; render(); }, 3500);
+    }
+  }
   render();
 }
 function getSyncableState(){
@@ -1720,8 +1747,8 @@ function findCpuExchangeTarget(p){
     if(!neededType) continue;
     if(!best || b.priority > best.priority) best = {receiveType: neededType, priority: b.priority, cost: b.cost};
   }
+  if(canAlreadyBuildSomething) return null; // don't disturb resources via exchange when something is already buildable right now
   if(!best){
-    if(canAlreadyBuildSomething) return null; // no need to exchange, something is already affordable right now
     const sorted = [...RESOURCE_TYPES].sort((a,b)=>p.resources[b]-p.resources[a]);
     const giveType = sorted[0];
     const receiveType = sorted[sorted.length-1];
@@ -1769,21 +1796,52 @@ function continueCpuTurnAfterExchange(cpuIdx, exchangesDone){
   let buildDecision = null; // {key, isProduction, cellIdx, emoji, name}
   if(!state.actionUsed){
     const humanIdx = 1 - cpuIdx;
-    const economyThreshold = state.cpuStrategy==='economy' ? 4 : state.cpuStrategy==='rush' ? 1 : 3;
+    const economyThreshold = state.cpuStrategy==='economy' ? 6 : 5;
     const ownedProductionCount = state.board.filter(c => c && c.player===cpuIdx && c.isProduction).length;
     const turnsRemaining = MAX_TURNS - p.turnsPlayed;
-    const needsEconomy = ownedProductionCount < economyThreshold && turnsRemaining > 3;
+    const totalResources = RESOURCE_TYPES.reduce((s,t) => s + p.resources[t], 0);
+    const runningDry = totalResources < 3 && ownedProductionCount < 4 && turnsRemaining > 2;
+    const needsEconomy = (ownedProductionCount < economyThreshold && turnsRemaining > 3) || runningDry;
+
+    function tryOpeningBook(){
+      // proven opening: storehouse -> depot -> bank uses every starting resource with zero waste by turn 3
+      const owns = (key) => state.board.some(c => c && c.player===cpuIdx && c.building===key);
+      const canAfford = (key, isProduction) => {
+        const {cost} = computeCost(key, isProduction, p);
+        return Object.keys(cost).every(t => p.resources[t] >= cost[t]);
+      };
+      if(p.turnsPlayed===0 && !owns('storehouse') && canAfford('storehouse', true)){
+        const cellIdx = pickCpuBuildCell(cpuIdx);
+        if(cellIdx!==-1) return {key:'storehouse', isProduction:true, cellIdx, emoji:PRODUCTION_BUILDINGS.storehouse.emoji, name:PRODUCTION_BUILDINGS.storehouse.name};
+      } else if(p.turnsPlayed===1 && !owns('depot') && canAfford('depot', true)){
+        const cellIdx = pickCpuBuildCell(cpuIdx);
+        if(cellIdx!==-1) return {key:'depot', isProduction:true, cellIdx, emoji:PRODUCTION_BUILDINGS.depot.emoji, name:PRODUCTION_BUILDINGS.depot.name};
+      } else if(p.turnsPlayed===2 && !owns('bank') && state.buildingSupply.bank>0 && canAfford('bank', false)){
+        const cellIdx = pickCpuBuildCell(cpuIdx, true);
+        if(cellIdx!==-1) return {key:'bank', isProduction:false, cellIdx, emoji:POINT_BUILDINGS.bank.emoji, name:POINT_BUILDINGS.bank.name};
+      }
+      return null;
+    }
 
     function pickFromTop(list){
       if(list.length===0) return null;
       const top = list.slice(0, Math.min(3, list.length));
-      return top[Math.floor(Math.random()*top.length)];
+      const roll = Math.random();
+      if(roll < 0.6 || top.length===1) return top[0];
+      if(roll < 0.85 && top.length>=2) return top[1];
+      return top[top.length-1];
     }
 
-    function tryPointBuildings(){
+    function scorePointCandidates(){
       const candidates = [];
       const seasonTurn = p.turnsPlayed % TURNS_PER_SEASON;
       const taxComingSoon = seasonTurn === TURNS_PER_SEASON - 1; // about to hit a tax boundary
+      let bestFortEnemyAdj = 0;
+      for(let i=0;i<BOARD_SIZE;i++){
+        if(state.board[i] || state.specialTiles[i]==='rock') continue;
+        const adj = neighborIndices(i).filter(n => state.board[n] && state.board[n].player===humanIdx).length;
+        if(adj > bestFortEnemyAdj) bestFortEnemyAdj = adj;
+      }
       for(const key in POINT_BUILDINGS){
         const supply = state.buildingSupply[key];
         if(supply <= 0) continue;
@@ -1796,54 +1854,65 @@ function continueCpuTurnAfterExchange(cpuIdx, exchangesDone){
             if(humanOwnsThis) scarceBonus += 6; // react: opponent already grabbed one, hurry for the rest
           }
           let strategicBonus = (key==='bank' || key==='fort') ? 3 : 0;
-          if(key==='bank' && taxComingSoon) strategicBonus += 6; // build the bank right before tax hits
+          if(key==='fort' && bestFortEnemyAdj >= 2){
+            const lateGameFactor = turnsRemaining > 2 ? 1 : 0.3; // stolen resources are less useful with little game left to spend them
+            strategicBonus += bestFortEnemyAdj * 3 * lateGameFactor;
+          }
+          if(key==='bank' && taxComingSoon) strategicBonus += 14; // build the bank right before tax hits
+          const totalCost = RESOURCE_TYPES.reduce((s,t) => s + (cost[t]||0), 0);
+          const efficiency = totalCost>0 ? (POINT_BUILDINGS[key].points / totalCost) * 4 : 0;
+          const highValueBonus = POINT_BUILDINGS[key].points >= 7 ? 4 : 0; // temple, lighthouse, castle
           const totalAfterPurchase = RESOURCE_TYPES.reduce((s,t) => s + p.resources[t] - (cost[t]||0), 0);
           const wouldDeplete = totalAfterPurchase < 2 && ownedProductionCount < 3 && turnsRemaining > 1;
           if(wouldDeplete) continue; // safety: don't leave the CPU with nothing to work with before it has income
           const taxReserveNeeded = (taxComingSoon && key!=='bank' && ownedProductionCount < 2) ? TAX_AMOUNT : 0;
           if(totalAfterPurchase < taxReserveNeeded) continue; // safety: keep enough to cover next turn's tax
-          candidates.push({key, priority: POINT_BUILDINGS[key].points + scarceBonus + strategicBonus});
+          candidates.push({key, isProduction:false, priority: POINT_BUILDINGS[key].points + scarceBonus + strategicBonus + efficiency + highValueBonus});
         }
       }
-      candidates.sort((a,b)=>b.priority-a.priority);
-      const chosen = pickFromTop(candidates);
-      if(chosen){
-        const key = chosen.key;
-        let cellIdx;
-        if(key==='monument') cellIdx = pickCpuBuildCellForMonument(cpuIdx);
-        else if(key==='fort') cellIdx = pickCpuBuildCellForFort(cpuIdx, humanIdx);
-        else cellIdx = pickCpuBuildCell(cpuIdx, true); // avoid fog for point buildings
-        if(cellIdx!==-1){
-          return {key, isProduction:false, cellIdx, emoji:POINT_BUILDINGS[key].emoji, name:POINT_BUILDINGS[key].name};
-        }
-      }
-      return null;
+      return candidates;
     }
-    function tryProductionBuildings(){
+    function scoreProductionCandidates(){
       const candidates = [];
       for(const key in PRODUCTION_BUILDINGS){
         const {cost} = computeCost(key, true, p);
         const affordable = Object.keys(cost).every(t => p.resources[t] >= cost[t]);
         if(affordable){
           const outputCount = Object.keys(PRODUCTION_BUILDINGS[key].produces).length;
-          candidates.push({key, priority: outputCount});
+          const economyBonus = needsEconomy ? 6 : 0; // keep production competitive while building up the economy
+          candidates.push({key, isProduction:true, priority: outputCount + economyBonus});
         }
       }
-      candidates.sort((a,b)=>b.priority-a.priority);
-      const chosen = pickFromTop(candidates);
-      if(chosen){
+      return candidates;
+    }
+    function resolveCandidate(chosen){
+      if(!chosen) return null;
+      const key = chosen.key;
+      if(!chosen.isProduction){
+        let cellIdx;
+        if(key==='monument') cellIdx = pickCpuBuildCellForMonument(cpuIdx);
+        else if(key==='fort') cellIdx = pickCpuBuildCellForFort(cpuIdx, humanIdx);
+        else cellIdx = pickCpuBuildCell(cpuIdx, true); // avoid fog for point buildings
+        if(cellIdx===-1) return null;
+        return {key, isProduction:false, cellIdx, emoji:POINT_BUILDINGS[key].emoji, name:POINT_BUILDINGS[key].name};
+      } else {
         const cellIdx = pickCpuBuildCell(cpuIdx);
-        if(cellIdx!==-1){
-          return {key:chosen.key, isProduction:true, cellIdx, emoji:PRODUCTION_BUILDINGS[chosen.key].emoji, name:PRODUCTION_BUILDINGS[chosen.key].name};
-        }
+        if(cellIdx===-1) return null;
+        return {key, isProduction:true, cellIdx, emoji:PRODUCTION_BUILDINGS[key].emoji, name:PRODUCTION_BUILDINGS[key].name};
       }
-      return null;
     }
 
-    if(needsEconomy){
-      buildDecision = tryProductionBuildings() || tryPointBuildings();
-    } else {
-      buildDecision = tryPointBuildings() || tryProductionBuildings();
+    function sortedTop(list){
+      list.sort((a,b)=>b.priority-a.priority);
+      return pickFromTop(list);
+    }
+    buildDecision = tryOpeningBook();
+    if(!buildDecision){
+      if(needsEconomy){
+        buildDecision = resolveCandidate(sortedTop(scoreProductionCandidates())) || resolveCandidate(sortedTop(scorePointCandidates()));
+      } else {
+        buildDecision = resolveCandidate(sortedTop(scorePointCandidates())) || resolveCandidate(sortedTop(scoreProductionCandidates()));
+      }
     }
   }
 
@@ -2494,7 +2563,7 @@ function renderSetup(){
         <button class="wood-btn wide" style="margin-top:8px;" onclick="openTour()">🧭 チュートリアル</button>
         <button class="wood-btn small" style="margin-top:8px;" onclick="startTestGame()">🧪 テスト版(すぐ盤面へ)</button>
         <button class="wood-btn small" style="margin-top:8px;" onclick="toggleTutorial()">📖 くわしいあそびかたを見る</button>
-        <div style="font-size:9px; color:var(--parchment-dark); text-align:center; margin-top:10px; opacity:.6;">${APP_VERSION}</div>
+        <div style="font-size:11px; font-weight:700; color:var(--gold); text-align:center; margin-top:10px;">${APP_VERSION}</div>
       </div>
     `;
   }
@@ -2782,6 +2851,7 @@ function renderPlaying(){
       </div>
       ${renderScoreCard(1)}
     </div>
+    ${state.onlineMode && state.onlineOpponentActionText ? `<div class="cpu-thinking decided" style="margin-bottom:8px;">${state.onlineOpponentActionText}</div>` : ''}
     <div class="play-controls">
       ${(state.vsComputer && state.current===state.cpuPlayerIdx) ? `
         <div class="cpu-thinking ${state.cpuActionText ? 'decided' : ''}">${state.cpuActionText ? state.cpuActionText : `🤖 ${p.name}が考え中...`}</div>
