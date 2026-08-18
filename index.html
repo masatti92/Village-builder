@@ -677,7 +677,7 @@ const ONLINE_LOCAL_ONLY_KEYS = [
   'onlineGuestName','onlineGuestProf','onlineError','onlineJoinCodeInput','cpuActionText','vsComputer','cpuPlayerIdx'
 ];
 
-const APP_VERSION = 'v2026.08.18-2';
+const APP_VERSION = 'v2026.08.18-3';
 
 // ---------- remembered player name (per device) ----------
 const PLAYER_NAME_KEY = 'villageBuilderPlayerName';
@@ -1886,7 +1886,7 @@ function continueCpuTurnAfterExchange(cpuIdx, exchangesDone){
   let buildDecision = null; // {key, isProduction, cellIdx, emoji, name}
   if(!state.actionUsed){
     const humanIdx = 1 - cpuIdx;
-    const economyThreshold = state.cpuStrategy==='economy' ? 6 : 5;
+    const economyThreshold = state.cpuStrategy==='economy' ? 5 : 4;
     const ownedProductionCount = state.board.filter(c => c && c.player===cpuIdx && c.isProduction).length;
     const turnsRemaining = MAX_TURNS - p.turnsPlayed;
     const totalResources = RESOURCE_TYPES.reduce((s,t) => s + p.resources[t], 0);
@@ -1943,21 +1943,23 @@ function continueCpuTurnAfterExchange(cpuIdx, exchangesDone){
             const humanOwnsThis = state.board.some(c => c && c.player===humanIdx && !c.isProduction && c.building===key);
             if(humanOwnsThis) scarceBonus += 6; // react: opponent already grabbed one, hurry for the rest
           }
-          let strategicBonus = (key==='bank' || key==='fort') ? 3 : 0;
+          let strategicBonus = (key==='bank' || key==='fort') ? 1 : 0;
           if(key==='fort' && bestFortEnemyAdj >= 2){
             const lateGameFactor = turnsRemaining > 2 ? 1 : 0.3; // stolen resources are less useful with little game left to spend them
             strategicBonus += bestFortEnemyAdj * 3 * lateGameFactor;
           }
-          if(key==='bank' && taxComingSoon) strategicBonus += 14; // build the bank right before tax hits
+          if(key==='bank' && taxComingSoon) strategicBonus += 2; // build the bank right before tax hits
           const totalCost = RESOURCE_TYPES.reduce((s,t) => s + (cost[t]||0), 0);
-          const efficiency = totalCost>0 ? (POINT_BUILDINGS[key].points / totalCost) * 4 : 0;
-          const highValueBonus = POINT_BUILDINGS[key].points >= 7 ? 4 : 0; // temple, lighthouse, castle
+          // resources are rarely the true bottleneck (turn-slots are), so efficiency (points/cost)
+          // matters much less than raw points; weight points heavily instead
+          const efficiency = totalCost>0 ? (POINT_BUILDINGS[key].points / totalCost) * 1 : 0;
+          const highValueBonus = POINT_BUILDINGS[key].points >= 7 ? 6 : 0; // temple, lighthouse, castle
           const totalAfterPurchase = RESOURCE_TYPES.reduce((s,t) => s + p.resources[t] - (cost[t]||0), 0);
           const wouldDeplete = totalAfterPurchase < 2 && ownedProductionCount < 3 && turnsRemaining > 1;
           if(wouldDeplete) continue; // safety: don't leave the CPU with nothing to work with before it has income
           const taxReserveNeeded = (taxComingSoon && key!=='bank' && ownedProductionCount < 2) ? TAX_AMOUNT : 0;
           if(totalAfterPurchase < taxReserveNeeded) continue; // safety: keep enough to cover next turn's tax
-          candidates.push({key, isProduction:false, priority: POINT_BUILDINGS[key].points + scarceBonus + strategicBonus + efficiency + highValueBonus});
+          candidates.push({key, isProduction:false, priority: POINT_BUILDINGS[key].points * 1.6 + scarceBonus + strategicBonus + efficiency + highValueBonus});
         }
       }
       return candidates;
