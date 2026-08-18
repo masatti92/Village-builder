@@ -677,7 +677,18 @@ const ONLINE_LOCAL_ONLY_KEYS = [
   'onlineGuestName','onlineGuestProf','onlineError','onlineJoinCodeInput','cpuActionText','vsComputer','cpuPlayerIdx'
 ];
 
-const APP_VERSION = 'v2026.08.18-1';
+const APP_VERSION = 'v2026.08.18-2';
+
+// ---------- remembered player name (per device) ----------
+const PLAYER_NAME_KEY = 'villageBuilderPlayerName';
+function getSavedPlayerName(){
+  try{ return (localStorage.getItem(PLAYER_NAME_KEY) || '').trim(); }catch(e){ return ''; }
+}
+function savePlayerName(name){
+  try{
+    if(name && name.trim()) localStorage.setItem(PLAYER_NAME_KEY, name.trim().slice(0,10));
+  }catch(e){}
+}
 
 const RESOURCE_TYPES = ['wood','stone','wheat','wool'];
 const RES_ICON = {wood:'🌲', stone:'🪨', wheat:'🌾', wool:'🐏'};
@@ -1108,7 +1119,7 @@ function syncAllDisplayResources(){
 function freshState(){
   return {
     phase:'setup',
-    setupNames:['',''],
+    setupNames:[getSavedPlayerName(), ''],
     setupProf:[null,null],
     setupError:null,
     setupStep:0,
@@ -1124,9 +1135,9 @@ function freshState(){
     myPlayerIdx:null,
     isHost:false,
     onlineStep:'menu',
-    onlineHostName:'',
+    onlineHostName:getSavedPlayerName(),
     onlineHostProf:null,
-    onlineGuestName:'',
+    onlineGuestName:getSavedPlayerName(),
     onlineGuestProf:null,
     onlineError:null,
     onlineJoinCodeInput:'',
@@ -1253,6 +1264,7 @@ function goToP1Job(){
     render();
     return;
   }
+  savePlayerName(state.setupNames[0]);
   state.setupStep = 2;
   state.setupError = null;
   render();
@@ -1282,7 +1294,8 @@ function goToP2Job(){
   render();
 }
 function setCpuOpponent(){
-  state.setupNames[0] = state.setupNames[0] && state.setupNames[0].trim() ? state.setupNames[0] : 'あなた';
+  state.setupNames[0] = state.setupNames[0] && state.setupNames[0].trim() ? state.setupNames[0] : (getSavedPlayerName() || 'あなた');
+  savePlayerName(state.setupNames[0]);
   state.setupNames[1] = 'CPU';
   const profKeys = Object.keys(PROFESSIONS);
   state.setupProf[1] = profKeys[Math.floor(Math.random()*profKeys.length)];
@@ -1328,6 +1341,7 @@ async function submitOnlineCreate(){
     render();
     return;
   }
+  savePlayerName(state.onlineHostName);
   state.onlineStep = 'create-job';
   state.onlineError = null;
   render();
@@ -1411,6 +1425,7 @@ function goOnlineJoinJob(){
     render();
     return;
   }
+  savePlayerName(state.onlineGuestName);
   state.onlineStep = 'join-job';
   state.onlineError = null;
   render();
