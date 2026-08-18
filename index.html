@@ -582,6 +582,12 @@ input.name-input{
 .castle-modal{border-color: var(--gold) !important; box-shadow:0 10px 0 var(--gold), 0 0 30px rgba(212,169,55,.5) !important;}
 .cell.building-castle{box-shadow:0 0 10px 3px var(--gold), inset 0 0 0 2px var(--gold); animation:castleGlow 1.6s ease-in-out infinite;}
 @keyframes castleGlow{0%,100%{box-shadow:0 0 6px 2px var(--gold), inset 0 0 0 2px var(--gold);} 50%{box-shadow:0 0 14px 5px var(--gold), inset 0 0 0 2px var(--gold);}}
+.ranking-row{display:flex; align-items:center; gap:8px; padding:8px 6px; border-bottom:1px dashed var(--parchment-dark);}
+.ranking-row:last-child{border-bottom:none;}
+.ranking-rank{width:28px; text-align:center; font-weight:900; font-size:15px; color:var(--wood-dark); flex-shrink:0;}
+.ranking-name{flex:1; font-weight:700; color:var(--wood-dark); font-size:14px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
+.ranking-mode{font-size:11px; font-weight:700; color:var(--wood-dark); opacity:.75; flex-shrink:0;}
+.ranking-score{font-weight:900; color:var(--gold); font-size:14px; flex-shrink:0; min-width:52px; text-align:right;}
 </style>
 <script src="https://unpkg.com/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
 </head>
@@ -598,6 +604,69 @@ try {
     supabaseClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
   }
 } catch(e){ console.error('Supabase init failed', e); }
+
+// ---------- ranking ----------
+const RANKING_MODE_LABELS = {all:'総合', twoplayer:'👥 二人対戦', cpu:'🤖 CPU戦', online:'🌐 ローカルバトル'};
+function escapeHtml(str){
+  return String(str==null ? '' : str).replace(/[&<>"']/g, ch => ({
+    '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'
+  }[ch]));
+}
+async function submitScore(name, score, mode){
+  if(!supabaseClient || !name) return;
+  try{
+    await supabaseClient.from('scores').insert({player_name: String(name).slice(0,30), score, mode});
+  }catch(e){ console.error('score submit failed', e); }
+}
+function submitFinishedScores(){
+  if(state.scoreSubmitted) return;
+  state.scoreSubmitted = true;
+  if(!supabaseClient) return;
+  const mode = state.onlineMode ? 'online' : (state.vsComputer ? 'cpu' : 'twoplayer');
+  if(mode === 'online'){
+    const myIdx = state.myPlayerIdx;
+    const me = (myIdx===0 || myIdx===1) ? state.players[myIdx] : null;
+    if(me && me.name) submitScore(me.name, me.points, mode);
+  } else if(mode === 'cpu'){
+    const humanIdx = 1 - state.cpuPlayerIdx;
+    const human = state.players[humanIdx];
+    if(human && human.name) submitScore(human.name, human.points, mode);
+  } else {
+    state.players.forEach(pl=>{ if(pl && pl.name) submitScore(pl.name, pl.points, mode); });
+  }
+}
+async function loadRanking(){
+  if(!supabaseClient){ state.rankingLoading=false; state.rankingError='オンライン機能が使えないため、ランキングを表示できません'; render(); return; }
+  state.rankingLoading = true;
+  state.rankingError = null;
+  render();
+  try{
+    let query = supabaseClient.from('scores').select('*').order('score', {ascending:false}).limit(50);
+    if(state.rankingFilter !== 'all') query = query.eq('mode', state.rankingFilter);
+    const {data, error} = await query;
+    if(error) throw error;
+    state.rankingData = data || [];
+  }catch(e){
+    console.error('ranking load failed', e);
+    state.rankingError = 'ランキングの取得に失敗しました。通信環境を確認してください';
+  }
+  state.rankingLoading = false;
+  render();
+}
+function openRanking(){
+  state.showRanking = true;
+  loadRanking();
+}
+function closeRanking(){
+  state.showRanking = false;
+  render();
+}
+function setRankingFilter(f){
+  if(state.rankingFilter === f) return;
+  state.rankingFilter = f;
+  loadRanking();
+}
+
 let realtimeChannel = null;
 let lastPushedStateJSON = null;
 let pushDebounceTimer = null;
@@ -608,7 +677,7 @@ const ONLINE_LOCAL_ONLY_KEYS = [
   'onlineGuestName','onlineGuestProf','onlineError','onlineJoinCodeInput','cpuActionText','vsComputer','cpuPlayerIdx'
 ];
 
-const APP_VERSION = 'v2026.08.17-4';
+const APP_VERSION = 'v2026.08.18-1';
 
 const RESOURCE_TYPES = ['wood','stone','wheat','wool'];
 const RES_ICON = {wood:'🌲', stone:'🪨', wheat:'🌾', wool:'🐏'};
@@ -1109,6 +1178,12 @@ function freshState(){
     roundProduction:[null,null],
     profInfoOpen:null,
     log:[],
+    showRanking:false,
+    rankingLoading:false,
+    rankingError:null,
+    rankingData:[],
+    rankingFilter:'all',
+    scoreSubmitted:false,
   };
 }
 let state = freshState();
@@ -2560,6 +2635,7 @@ function renderSetup(){
         <button class="wood-btn gold wide" style="margin-top:12px; font-size:16px; padding:14px;" onclick="goSetupHomeStart()">👥 二人で対戦(同じ画面で交互に)</button>
         <button class="wood-btn wide" style="margin-top:8px; line-height:1.4;" onclick="openOnlineMenu()">🌐 ローカルバトル<br>(別のスマホと対戦。合言葉で参加)</button>
         <button class="wood-btn wide" style="margin-top:8px;" onclick="setCpuOpponent()">🤖 CPUと対戦する</button>
+        <button class="wood-btn wide" style="margin-top:8px;" onclick="openRanking()">🏆 ランキング</button>
         <button class="wood-btn wide" style="margin-top:8px;" onclick="openTour()">🧭 チュートリアル</button>
         <button class="wood-btn small" style="margin-top:8px;" onclick="startTestGame()">🧪 テスト版(すぐ盤面へ)</button>
         <button class="wood-btn small" style="margin-top:8px;" onclick="toggleTutorial()">📖 くわしいあそびかたを見る</button>
@@ -3178,6 +3254,44 @@ function renderTourOverlay(){
   `;
 }
 
+function renderRankingModal(){
+  const filters = ['all','twoplayer','cpu','online'];
+  const tabsHtml = filters.map(f=>
+    `<div class="tab-btn ${state.rankingFilter===f?'active':''}" onclick="setRankingFilter('${f}')">${RANKING_MODE_LABELS[f]}</div>`
+  ).join('');
+  let bodyHtml;
+  if(state.rankingLoading){
+    bodyHtml = `<div style="text-align:center; padding:30px 0; color:var(--wood-dark);">読み込み中…</div>`;
+  } else if(state.rankingError){
+    bodyHtml = `<div style="text-align:center; padding:30px 0; color:var(--bad);">${escapeHtml(state.rankingError)}</div>`;
+  } else if(!state.rankingData || state.rankingData.length===0){
+    bodyHtml = `<div style="text-align:center; padding:30px 0; color:var(--wood-dark);">まだ記録がありません</div>`;
+  } else {
+    bodyHtml = state.rankingData.map((row,i)=>{
+      const medal = i===0?'🥇':i===1?'🥈':i===2?'🥉':`${i+1}`;
+      const modeBadge = RANKING_MODE_LABELS[row.mode] || row.mode;
+      return `
+        <div class="ranking-row">
+          <div class="ranking-rank">${medal}</div>
+          <div class="ranking-name">${escapeHtml(row.player_name)}</div>
+          <div class="ranking-mode">${modeBadge}</div>
+          <div class="ranking-score">${row.score}pt</div>
+        </div>
+      `;
+    }).join('');
+  }
+  return `
+    <div class="overlay" onclick="if(event.target===this) closeRanking();">
+      <div class="modal">
+        <h2 style="text-align:center; margin-bottom:10px;">🏆 ランキング</h2>
+        <div style="display:flex; gap:6px; margin-bottom:10px;">${tabsHtml}</div>
+        <div style="max-height:50vh; overflow-y:auto;">${bodyHtml}</div>
+        <button class="wood-btn gold wide" style="margin-top:12px;" onclick="closeRanking()">とじる</button>
+      </div>
+    </div>
+  `;
+}
+
 function renderTutorial(){
   const active = TUTORIAL_SECTIONS.find(s=>s.key===state.tutorialTab) || TUTORIAL_SECTIONS[0];
   const tabsHtml = TUTORIAL_SECTIONS.map(s=>
@@ -3495,7 +3609,8 @@ function render(){
   if(state.phase==='setup') html = renderSetup();
   else if(state.phase==='onlineSetup') html = renderOnlineSetup();
   else if(state.phase==='playing') html = renderPlaying();
-  else html = renderFinished();
+  else { html = renderFinished(); submitFinishedScores(); }
+  if(state.showRanking) html += renderRankingModal();
   if(state.endTurnConfirmOpen) html += renderEndTurnConfirmModal();
   if(state.startBonusCelebration) html += renderStartBonusModal();
   if(state.goldBonusCelebration) html += renderGoldBonusModal();
