@@ -589,7 +589,7 @@ input.name-input{
 .ranking-mode{font-size:11px; font-weight:700; color:var(--wood-dark); opacity:.75; flex-shrink:0;}
 .ranking-score{font-weight:900; color:var(--gold); font-size:14px; flex-shrink:0; min-width:52px; text-align:right;}
 </style>
-<script src="https://unpkg.com/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
+<script src="https://unpkg.com/@supabase/supabase-js@2/dist/umd/supabase.js" onerror="this.onerror=null; var s=document.createElement('script'); s.src='https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js'; document.head.appendChild(s);"></script>
 </head>
 <body>
 <div id="app"></div>
@@ -599,11 +599,22 @@ input.name-input{
 const SUPABASE_URL = 'https://xgwqmpridvbdlfbumqqs.supabase.co';
 const SUPABASE_KEY = 'sb_publishable_N3oeLwYsMdWJK7A6OOzxPw_xfJ64UO4';
 let supabaseClient = null;
-try {
-  if(typeof window !== 'undefined' && window.supabase && window.supabase.createClient){
-    supabaseClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+function ensureSupabaseClient(){
+  // The Supabase SDK loads from an external CDN <script> tag. If that load is slow,
+  // temporarily blocked (flaky network, ad/privacy blocker, carrier proxy), or hasn't
+  // finished yet at page-load time, `supabaseClient` would otherwise stay null forever
+  // and every online feature (ローカルバトル, ランキング) would need a manual page reload.
+  // Calling this at the start of any Supabase-dependent action retries the init lazily.
+  if(!supabaseClient){
+    try {
+      if(typeof window !== 'undefined' && window.supabase && window.supabase.createClient){
+        supabaseClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+      }
+    } catch(e){ console.error('Supabase init failed', e); }
   }
-} catch(e){ console.error('Supabase init failed', e); }
+  return supabaseClient;
+}
+ensureSupabaseClient();
 
 // ---------- ranking ----------
 const RANKING_MODE_LABELS = {all:'総合', twoplayer:'👥 二人対戦', cpu:'🤖 CPU戦', online:'🌐 ローカルバトル'};
@@ -621,6 +632,7 @@ async function submitScore(name, score, mode){
 function submitFinishedScores(){
   if(state.scoreSubmitted) return;
   state.scoreSubmitted = true;
+  ensureSupabaseClient();
   if(!supabaseClient) return;
   const mode = state.onlineMode ? 'online' : (state.vsComputer ? 'cpu' : 'twoplayer');
   if(mode === 'online'){
@@ -636,6 +648,7 @@ function submitFinishedScores(){
   }
 }
 async function loadRanking(){
+  ensureSupabaseClient();
   if(!supabaseClient){ state.rankingLoading=false; state.rankingError='オンライン機能が使えないため、ランキングを表示できません'; render(); return; }
   state.rankingLoading = true;
   state.rankingError = null;
@@ -677,7 +690,7 @@ const ONLINE_LOCAL_ONLY_KEYS = [
   'onlineGuestName','onlineGuestProf','onlineError','onlineJoinCodeInput','cpuActionText','vsComputer','cpuPlayerIdx'
 ];
 
-const APP_VERSION = 'v2026.08.18-3';
+const APP_VERSION = 'v2026.08.18-5';
 
 // ---------- remembered player name (per device) ----------
 const PLAYER_NAME_KEY = 'villageBuilderPlayerName';
@@ -1360,6 +1373,7 @@ async function finalizeCreateRoom(){
     render();
     return;
   }
+  ensureSupabaseClient();
   if(!supabaseClient){
     state.onlineError = '通信の準備に失敗しました。ページを再読み込みしてみてね。';
     render();
@@ -1397,6 +1411,7 @@ async function submitOnlineJoinCode(){
     render();
     return;
   }
+  ensureSupabaseClient();
   if(!supabaseClient){
     state.onlineError = '通信の準備に失敗しました。ページを再読み込みしてみてね。';
     render();
@@ -2548,7 +2563,7 @@ function renderOnlineSetup(){
 
   if(step==='menu'){
     body = `
-      <div class="panel" style="text-align:center;">
+      <div style="text-align:center;">
         <div style="font-size:14px; color:var(--wood-dark); margin-bottom:14px;">友達とそれぞれのスマホで、リアルタイムに対戦できるよ。</div>
         <button class="wood-btn gold wide" style="padding:14px;" onclick="goOnlineCreateName()">🏠 部屋を作る</button>
         <button class="wood-btn wide" style="margin-top:8px;" onclick="goOnlineJoinName()">🔑 部屋に入る</button>
@@ -2576,7 +2591,7 @@ function renderOnlineSetup(){
     `;
   } else if(step==='host-waiting'){
     body = `
-      <div class="panel" style="text-align:center;">
+      <div style="text-align:center;">
         <div style="font-size:14px; color:var(--wood-dark); margin-bottom:10px;">この部屋コードを友達に伝えてね</div>
         <div style="font-family:'Zen Maru Gothic'; font-size:36px; font-weight:900; letter-spacing:.15em; color:var(--gold); background:#3a2a08; border-radius:12px; padding:16px; margin-bottom:14px;">${state.roomCode||'----'}</div>
         <div class="cpu-thinking" style="animation:cpuPulse 1.4s ease-in-out infinite;">🌐 友達が入ってくるのを待ってます...</div>
@@ -2614,7 +2629,7 @@ function renderOnlineSetup(){
     `;
   } else if(step==='guest-waiting'){
     body = `
-      <div class="panel" style="text-align:center;">
+      <div style="text-align:center;">
         <div class="cpu-thinking" style="animation:cpuPulse 1.4s ease-in-out infinite;">🌐 むらづくりが始まるのを待ってます...</div>
         <button class="wood-btn small" style="margin-top:12px;" onclick="backToHomeFromOnline()">やめる</button>
       </div>
@@ -2626,7 +2641,9 @@ function renderOnlineSetup(){
       <div class="eyebrow">VILLAGE CHRONICLE</div>
       <h1>🌐 ローカルバトル</h1>
     </div>
-    ${body}
+    <div class="panel">
+      ${body}
+    </div>
   `;
 }
 
