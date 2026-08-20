@@ -693,7 +693,7 @@ const ONLINE_LOCAL_ONLY_KEYS = [
   'onlineRouletteActive','onlineRouletteRevealed'
 ];
 
-const APP_VERSION = 'v2026.08.20-7';
+const APP_VERSION = 'v2026.08.20-9';
 
 // ---------- remembered player name (per device) ----------
 const PLAYER_NAME_KEY = 'villageBuilderPlayerName';
@@ -1605,12 +1605,29 @@ function applyRemoteGameState(remote){
   }
   lastPushedStateJSON = JSON.stringify(getSyncableState());
 
+  // Figure out whether this sync includes a new opponent building FIRST (before
+  // deciding how to show the text narration below), by diffing against oldBoard.
+  // If so, the narration text is held back until that building's flight animation
+  // actually lands, so the player watches the icon arrive before reading what it
+  // was -- rather than the text popping up immediately while the icon is still
+  // mid-flight.
+  let newOpponentBuildIdx = -1;
+  if(!isFirstOnlineSync && state.myPlayerIdx!==null && oldBoard.length===state.board.length){
+    for(let i=0;i<state.board.length;i++){
+      if(!oldBoard[i] && state.board[i] && state.board[i].player!==state.myPlayerIdx){
+        newOpponentBuildIdx = i;
+        break;
+      }
+    }
+  }
+
   // Narrate what the opponent did since our last known state, by finding log entries
   // that are new since oldLogHead. Any remote update that reaches this point already
   // passed the echo filter in handleRemoteRoomUpdate (own pushes are skipped), so any
   // new log entries here represent genuine opponent actions -- builds, exchanges,
   // production income, tax, events, fort steals, all already have addLog() messages.
-  if(state.myPlayerIdx!==null && state.log && state.log.length && oldLogHead!==null){
+  function showOpponentNarration(){
+    if(state.myPlayerIdx===null || !state.log || !state.log.length || oldLogHead===null) return;
     const newEntries = [];
     for(let i=0;i<state.log.length;i++){
       if(state.log[i]===oldLogHead) break;
@@ -1619,11 +1636,17 @@ function applyRemoteGameState(remote){
     if(newEntries.length){
       newEntries.reverse(); // oldest of the newly-seen entries first, matches the order they happened in
       state.onlineOpponentActionText = '🌐 ' + newEntries.join(' / ');
+      render();
       clearTimeout(window.__onlineActionTimer);
       const showMs = 2600 + newEntries.length * 1600; // give longer combos more time to read
       window.__onlineActionTimer = setTimeout(()=>{ state.onlineOpponentActionText = null; render(); }, showMs);
     }
   }
+  if(newOpponentBuildIdx===-1){
+    showOpponentNarration(); // no build animation to wait for -- show it right away
+  }
+  // (when there IS a new build, showOpponentNarration() is instead called from the
+  // animateAndPlaceCpu onDone callback below, once the icon has landed)
 
   // If the opponent just made an exchange, play the give/receive icon flourish on
   // their player card (purely cosmetic -- the resource totals are already correct
@@ -1648,15 +1671,6 @@ function applyRemoteGameState(remote){
   // nothing CPU-specific) instead of letting it just appear instantly. The cell is
   // temporarily hidden and restored once the flight lands, mirroring how the CPU's
   // own build already delays applying the placement until its animation finishes.
-  let newOpponentBuildIdx = -1;
-  if(!isFirstOnlineSync && state.myPlayerIdx!==null && oldBoard.length===state.board.length){
-    for(let i=0;i<state.board.length;i++){
-      if(!oldBoard[i] && state.board[i] && state.board[i].player!==state.myPlayerIdx){
-        newOpponentBuildIdx = i;
-        break;
-      }
-    }
-  }
   if(newOpponentBuildIdx!==-1){
     const cell = state.board[newOpponentBuildIdx];
     const b = cell.isProduction ? PRODUCTION_BUILDINGS[cell.building] : POINT_BUILDINGS[cell.building];
@@ -1665,6 +1679,17 @@ function applyRemoteGameState(remote){
     animateAndPlaceCpu(cell.player, newOpponentBuildIdx, b.emoji, ()=>{
       state.board[newOpponentBuildIdx] = cell;
       render();
+      showOpponentNarration(); // now that the building has landed, reveal what happened
+      // Same self-clear as placeBuilding(): state.lastPlacedIdx was already synced
+      // in from the opponent's push, so without this it would keep replaying the
+      // "ドン！" pop text on every later render() on THIS device too (narration
+      // timers, further syncs, etc.) until the opponent's own clear eventually
+      // propagates back over the network. Clear it locally right away instead of
+      // waiting on that round trip.
+      const landedIdx = newOpponentBuildIdx;
+      setTimeout(()=>{
+        if(state.lastPlacedIdx === landedIdx){ state.lastPlacedIdx = null; render(); }
+      }, 1100);
     });
   } else {
     render();
@@ -2482,6 +2507,16 @@ function placeBuilding(idx){
   state.mode = 'idle';
   state.lastPlacedIdx = idx;
   render();
+  // state.lastPlacedIdx drives the one-shot "ドン！" pop text on the cell (see
+  // renderBoard). Because render() rebuilds the whole board's innerHTML from scratch
+  // every time, leaving lastPlacedIdx set forever would recreate that pop-text
+  // element (replaying its animation) on EVERY subsequent render() call, not just
+  // the first -- very noticeable in online battle where several unrelated re-renders
+  // (opponent syncs, narration timers, other animations) can fire afterward. Clear it
+  // once the pop animation (1s) has had time to finish.
+  setTimeout(()=>{
+    if(state.lastPlacedIdx === idx){ state.lastPlacedIdx = null; render(); }
+  }, 1100);
 }
 
 // ---------- production & tax ----------
