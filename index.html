@@ -693,7 +693,7 @@ const ONLINE_LOCAL_ONLY_KEYS = [
   'onlineRouletteActive','onlineRouletteRevealed'
 ];
 
-const APP_VERSION = 'v2026.08.20-4';
+const APP_VERSION = 'v2026.08.20-7';
 
 // ---------- remembered player name (per device) ----------
 const PLAYER_NAME_KEY = 'villageBuilderPlayerName';
@@ -1170,6 +1170,8 @@ function freshState(){
     onlineError:null,
     onlineJoinCodeInput:'',
     onlineOpponentActionText:null,
+    actionEvents:[],
+    actionEventSeq:0,
     startBonusCelebration:null,
     showTutorial:false,
     tutorialTab:'goal',
@@ -1232,6 +1234,17 @@ let state = freshState();
 function addLog(msg){
   state.log.unshift(msg);
   if(state.log.length>6) state.log.pop();
+}
+// A small structured (non-text) companion to addLog(), used to drive cosmetic
+// animations in online battle (see applyRemoteGameState) that need real data --
+// which resource types, which player -- rather than a human-readable string. Each
+// event gets a monotonically increasing seq so a remote device can tell which ones
+// are new since its last known state (plain object equality wouldn't survive the
+// JSON round-trip a network sync does).
+function pushActionEvent(evt){
+  evt.seq = ++state.actionEventSeq;
+  state.actionEvents.unshift(evt);
+  if(state.actionEvents.length>6) state.actionEvents.pop();
 }
 function canAffordCost(p, cost){
   return Object.keys(cost).every(k => p.resources[k] >= cost[k]);
@@ -1556,8 +1569,22 @@ async function startOnlineGameAsHost(remote){
   await pushGameStateNow();
 }
 function applyRemoteGameState(remote){
+  // Snapshot the most recent log entry BEFORE this sync overwrites state.log, so we
+  // can tell which entries are newly added (i.e. things the opponent just did).
+  // state.log already gets a human-readable line from addLog() for every notable
+  // action (build, exchange, production income, tax, event, fort steal, etc.), so
+  // reusing it here gives the same level of detail as the CPU's own turn narration,
+  // instead of only detecting new builds like a previous, more limited version did.
+  const oldLogHead = (state.log && state.log[0]) || null;
+  // Also snapshot the board so we can spot a newly-appeared opponent building and fly
+  // its icon into place (same flourish as animateAndPlaceCpu), instead of it just
+  // silently popping into existence.
   const oldBoard = state.board ? state.board.slice() : [];
-  const oldCurrent = state.current;
+  // And the highest actionEvents seq we've already seen, so we can spot a new
+  // opponent exchange and play the give/receive icon flourish for it. Plain object
+  // equality (like the string-based log check above) wouldn't survive the JSON
+  // round-trip a network sync does, so these events carry a monotonic seq instead.
+  const oldActionEventHeadSeq = (state.actionEvents && state.actionEvents[0] && state.actionEvents[0].seq) || 0;
   const isFirstOnlineSync = !state.onlineMode;
   const localOnly = {};
   ONLINE_LOCAL_ONLY_KEYS.forEach(k => { localOnly[k] = state[k]; });
@@ -1578,30 +1605,70 @@ function applyRemoteGameState(remote){
   }
   lastPushedStateJSON = JSON.stringify(getSyncableState());
 
-  // detect what the opponent did by diffing the board, so the other player can see it clearly
-  if(state.myPlayerIdx!==null && oldBoard.length===state.board.length){
-    let newBuildIdx = -1;
+  // Narrate what the opponent did since our last known state, by finding log entries
+  // that are new since oldLogHead. Any remote update that reaches this point already
+  // passed the echo filter in handleRemoteRoomUpdate (own pushes are skipped), so any
+  // new log entries here represent genuine opponent actions -- builds, exchanges,
+  // production income, tax, events, fort steals, all already have addLog() messages.
+  if(state.myPlayerIdx!==null && state.log && state.log.length && oldLogHead!==null){
+    const newEntries = [];
+    for(let i=0;i<state.log.length;i++){
+      if(state.log[i]===oldLogHead) break;
+      newEntries.push(state.log[i]);
+    }
+    if(newEntries.length){
+      newEntries.reverse(); // oldest of the newly-seen entries first, matches the order they happened in
+      state.onlineOpponentActionText = '🌐 ' + newEntries.join(' / ');
+      clearTimeout(window.__onlineActionTimer);
+      const showMs = 2600 + newEntries.length * 1600; // give longer combos more time to read
+      window.__onlineActionTimer = setTimeout(()=>{ state.onlineOpponentActionText = null; render(); }, showMs);
+    }
+  }
+
+  // If the opponent just made an exchange, play the give/receive icon flourish on
+  // their player card (purely cosmetic -- the resource totals are already correct
+  // in the synced state by this point either way).
+  if(!isFirstOnlineSync && state.myPlayerIdx!==null && state.actionEvents && state.actionEvents.length){
+    const newExchangeEvents = [];
+    for(let i=0;i<state.actionEvents.length;i++){
+      const evt = state.actionEvents[i];
+      if(evt.seq <= oldActionEventHeadSeq) break;
+      if(evt.type==='exchange' && evt.playerIdx !== state.myPlayerIdx) newExchangeEvents.push(evt);
+    }
+    newExchangeEvents.reverse(); // oldest first
+    newExchangeEvents.forEach((evt, i) => {
+      setTimeout(()=>{
+        animateExchangeOnCard(evt.playerIdx, evt.giveTypes.map(t=>RES_ICON[t]), RES_ICON[evt.receiveType]);
+      }, i * 1400); // stagger if the opponent squeezed in 2 exchanges (e.g. merchant) between syncs
+    });
+  }
+
+  // If the opponent just placed a building, fly its icon onto the board (reusing
+  // animateAndPlaceCpu, which only cares about a player index / cell index / emoji --
+  // nothing CPU-specific) instead of letting it just appear instantly. The cell is
+  // temporarily hidden and restored once the flight lands, mirroring how the CPU's
+  // own build already delays applying the placement until its animation finishes.
+  let newOpponentBuildIdx = -1;
+  if(!isFirstOnlineSync && state.myPlayerIdx!==null && oldBoard.length===state.board.length){
     for(let i=0;i<state.board.length;i++){
       if(!oldBoard[i] && state.board[i] && state.board[i].player!==state.myPlayerIdx){
-        newBuildIdx = i;
+        newOpponentBuildIdx = i;
         break;
       }
     }
-    if(newBuildIdx!==-1){
-      const c = state.board[newBuildIdx];
-      const b = c.isProduction ? PRODUCTION_BUILDINGS[c.building] : POINT_BUILDINGS[c.building];
-      const opponentName = state.players[c.player].name;
-      state.onlineOpponentActionText = `🌐 ${opponentName}が${b.emoji}${b.name}を建てました！`;
-    } else if(oldCurrent===state.myPlayerIdx && state.current!==state.myPlayerIdx){
-      const opponentIdx = 1 - state.myPlayerIdx;
-      state.onlineOpponentActionText = `🌐 ${state.players[opponentIdx].name}のターンが終わりました`;
-    }
-    if(state.onlineOpponentActionText){
-      clearTimeout(window.__onlineActionTimer);
-      window.__onlineActionTimer = setTimeout(()=>{ state.onlineOpponentActionText = null; render(); }, 3500);
-    }
   }
-  render();
+  if(newOpponentBuildIdx!==-1){
+    const cell = state.board[newOpponentBuildIdx];
+    const b = cell.isProduction ? PRODUCTION_BUILDINGS[cell.building] : POINT_BUILDINGS[cell.building];
+    state.board[newOpponentBuildIdx] = null; // hide until the flight lands
+    render();
+    animateAndPlaceCpu(cell.player, newOpponentBuildIdx, b.emoji, ()=>{
+      state.board[newOpponentBuildIdx] = cell;
+      render();
+    });
+  } else {
+    render();
+  }
 }
 function getSyncableState(){
   const out = {};
@@ -2209,11 +2276,13 @@ function pickReceive(type){
   RESOURCE_TYPES.forEach(t => { p.resources[t] -= state.exchangeGiveSelected[t]; });
   p.resources[type] += 1;
   syncDisplayResources(state.current);
-  const givenParts = RESOURCE_TYPES.filter(t=>state.exchangeGiveSelected[t]>0).map(t=>`${RES_ICON[t]}${state.exchangeGiveSelected[t]}`).join('+');
+  const giveTypesUsed = RESOURCE_TYPES.filter(t=>state.exchangeGiveSelected[t]>0);
+  const givenParts = giveTypesUsed.map(t=>`${RES_ICON[t]}${state.exchangeGiveSelected[t]}`).join('+');
   state.exchangeCount += 1;
   state.exchangeGiveSelected = {wood:0, stone:0, wheat:0, wool:0};
   if(state.exchangeCount >= exchangeLimit(p)) state.mode = 'idle';
   addLog(`${p.name}が交換で ${givenParts}→${RES_ICON[type]}1個`);
+  pushActionEvent({type:'exchange', playerIdx: state.current, giveTypes: giveTypesUsed, receiveType: type});
   render();
 }
 
@@ -2254,6 +2323,52 @@ function animateAndPlaceCpu(idx, cellIdx, emoji, onDone){
     flyer.remove();
     onDone();
   }, 800);
+}
+// Cosmetic-only exchange flourish for online battle: the "give" icon(s) fly up and
+// away from the opponent's player card and fade out, then the "receive" icon pops
+// in from below and settles. Unlike animateAndPlaceCpu, this never gates any game
+// logic -- the resources are already applied in the synced state by the time this
+// runs, so if the card elements aren't found this just silently does nothing.
+function animateExchangeOnCard(playerIdx, giveEmojis, receiveEmoji){
+  const cardEl = document.getElementById('player-card-'+playerIdx);
+  if(!cardEl) return;
+  const rect = cardEl.getBoundingClientRect();
+  const cx = rect.left + rect.width/2 - 15;
+  const cy = rect.top + rect.height/2 - 15;
+  giveEmojis.forEach((emoji, i) => {
+    const el = document.createElement('div');
+    el.className = 'flying-icon';
+    el.style.fontSize = '22px';
+    el.textContent = emoji;
+    el.style.left = (cx + (i - (giveEmojis.length-1)/2) * 22) + 'px';
+    el.style.top = cy + 'px';
+    document.body.appendChild(el);
+    requestAnimationFrame(()=>{
+      requestAnimationFrame(()=>{
+        el.style.transform = `translate(${(i%2?1:-1)*14}px, -44px) scale(0.5) rotate(${(i%2?1:-1)*20}deg)`;
+        el.style.opacity = '0';
+      });
+    });
+    setTimeout(()=>el.remove(), 750);
+  });
+  setTimeout(()=>{
+    const el = document.createElement('div');
+    el.className = 'flying-icon';
+    el.textContent = receiveEmoji;
+    el.style.left = cx + 'px';
+    el.style.top = (cy + 34) + 'px';
+    el.style.transform = 'scale(0.3)';
+    el.style.opacity = '0';
+    document.body.appendChild(el);
+    requestAnimationFrame(()=>{
+      requestAnimationFrame(()=>{
+        el.style.transform = 'translate(0, -34px) scale(1.5)';
+        el.style.opacity = '1';
+      });
+    });
+    setTimeout(()=>{ el.style.transform = 'translate(0, -34px) scale(1)'; }, 260);
+    setTimeout(()=>el.remove(), 900);
+  }, 450);
 }
 function animateAndPlace(idx){
   if(!state.selectedBuild){ placeBuilding(idx); return; }
