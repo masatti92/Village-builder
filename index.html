@@ -412,6 +412,8 @@ input.name-input{
 .bcard .disc-badge{background:var(--good); color:#fff; font-weight:700; font-size:13px; border-radius:9px; padding:2px 8px;}
 .bcard .effect-badge{background:#8b3a8b; color:#fff; font-weight:700; font-size:13px; border-radius:9px; padding:2px 8px;}
 .hint-text{font-size:12.5px; color:var(--wood-dark); text-align:center; margin-top:2px;}
+.effect-callout{background:#f6ecf6; border:2px solid #8b3a8b; border-radius:10px; padding:8px 10px; font-size:13px; color:var(--ink); text-align:left; line-height:1.45; margin:6px 2px 4px; animation:popIn .25s cubic-bezier(.34,1.56,.64,1);}
+.effect-callout b{color:#8b3a8b;}
 .play-hint-pill{
   background:#3a2a08; border:1px solid var(--gold); color:#ffe9a8;
   font-size:11.5px; font-weight:700; text-align:center; border-radius:8px; padding:6px 10px; margin-bottom:6px;
@@ -687,10 +689,11 @@ const ONLINE_LOCAL_ONLY_KEYS = [
   'mode','selectedBuild','buildTab','exchangeGiveSelected','showTutorial','tutorialTab',
   'tourOpen','tourStep','setupStep','setupNames','setupProf','setupError','profInfoOpen',
   'onlineMode','roomCode','myPlayerIdx','isHost','onlineStep','onlineHostName','onlineHostProf',
-  'onlineGuestName','onlineGuestProf','onlineError','onlineJoinCodeInput','cpuActionText','vsComputer','cpuPlayerIdx'
+  'onlineGuestName','onlineGuestProf','onlineError','onlineJoinCodeInput','cpuActionText','vsComputer','cpuPlayerIdx',
+  'onlineRouletteActive','onlineRouletteRevealed'
 ];
 
-const APP_VERSION = 'v2026.08.18-5';
+const APP_VERSION = 'v2026.08.20-4';
 
 // ---------- remembered player name (per device) ----------
 const PLAYER_NAME_KEY = 'villageBuilderPlayerName';
@@ -979,14 +982,23 @@ const BOARD_WIDTH = 6;
 const BOARD_SIZE = 36;
 const PLAYER_COLOR = ['var(--p1)', 'var(--p2)'];
 const EVENT_CHANCE = 0.15;
+// Each time an event has already happened this game, its weight is multiplied by this
+// factor (per repeat) so it's noticeably less likely to come up again -- but never
+// impossible, in case every other event has also already appeared a lot.
+const EVENT_REPEAT_DECAY = 0.35;
 
 function pickWeightedEvent(){
-  const totalWeight = EVENTS.reduce((s,e)=>s+(e.weight!==undefined?e.weight:1), 0);
+  const counts = state.eventOccurredCounts || {};
+  const weights = EVENTS.map(e => {
+    const base = e.weight!==undefined ? e.weight : 1;
+    const timesAlreadyHappened = counts[e.name] || 0;
+    return base * Math.pow(EVENT_REPEAT_DECAY, timesAlreadyHappened);
+  });
+  const totalWeight = weights.reduce((s,w)=>s+w, 0);
   let r = Math.random() * totalWeight;
-  for(const ev of EVENTS){
-    const w = ev.weight!==undefined ? ev.weight : 1;
-    if(r < w) return ev;
-    r -= w;
+  for(let i=0;i<EVENTS.length;i++){
+    if(r < weights[i]) return EVENTS[i];
+    r -= weights[i];
   }
   return EVENTS[EVENTS.length-1];
 }
@@ -1146,6 +1158,9 @@ function freshState(){
     onlineMode:false,
     roomCode:null,
     myPlayerIdx:null,
+    hostPlayerIdx:null,
+    onlineRouletteActive:false,
+    onlineRouletteRevealed:false,
     isHost:false,
     onlineStep:'menu',
     onlineHostName:getSavedPlayerName(),
@@ -1172,6 +1187,8 @@ function freshState(){
     exchangeGiveSelected:{wood:0, stone:0, wheat:0, wool:0},
     eventBanner:null,
     eventModalOpen:false,
+    eventAnnounceShown:false,
+    eventOccurredCounts:{},
     eventDeltas:null,
     eventDestroyed:null,
     eventGoldTiles:null,
@@ -1382,7 +1399,7 @@ async function finalizeCreateRoom(){
   const code = generateRoomCode();
   state.roomCode = code;
   state.isHost = true;
-  state.myPlayerIdx = 0;
+  state.myPlayerIdx = 0; // provisional; the real slot is decided by coin flip in startOnlineGameAsHost
   state.onlineStep = 'host-waiting';
   render();
   const initial = {
@@ -1452,7 +1469,7 @@ async function finalizeJoinRoom(){
     return;
   }
   state.isHost = false;
-  state.myPlayerIdx = 1;
+  state.myPlayerIdx = 1; // provisional; corrected from hostPlayerIdx once game state syncs in
   state.onlineStep = 'guest-waiting';
   render();
   const {data, error: fetchErr} = await supabaseClient.from('rooms').select('*').eq('code', state.roomCode).maybeSingle();
@@ -1501,27 +1518,36 @@ function handleRemoteRoomUpdate(remote){
   }
 }
 async function startOnlineGameAsHost(remote){
-  const winnerIdx = Math.random() < 0.5 ? 0 : 1;
-  const names = [remote.hostName, remote.guestName];
-  const profs = [remote.hostProf, remote.guestProf];
-  const loserIdx = 1 - winnerIdx;
+  // Who goes first (players[0]) is decided here by a coin flip, on the host's device,
+  // same spirit as local 2-player mode's roulette. The result is synced to the guest
+  // via state.hostPlayerIdx (which slot -- 0 or 1 -- the HOST ended up in); each
+  // device then derives its own state.myPlayerIdx FROM that synced value inside
+  // applyRemoteGameState, rather than trusting whatever was hardcoded earlier in
+  // finalizeCreateRoom/finalizeJoinRoom. A previous version hardcoded host=0/guest=1
+  // with no randomness at all to avoid a desync bug -- the real fix is to always
+  // derive myPlayerIdx from the same single source of truth (hostPlayerIdx) that
+  // decided the slot order, never assume it ahead of time.
   const savedRoomCode = state.roomCode;
+  const winnerIsHost = Math.random() < 0.5;
   state = freshState();
   state.onlineMode = true;
   state.isHost = true;
-  state.myPlayerIdx = 0;
+  state.hostPlayerIdx = winnerIsHost ? 0 : 1;
+  state.myPlayerIdx = state.hostPlayerIdx;
   state.roomCode = savedRoomCode;
-  state.players[0] = newPlayer(names[winnerIdx]);
-  state.players[1] = newPlayer(names[loserIdx]);
+  state.players[0] = newPlayer(winnerIsHost ? remote.hostName : remote.guestName);
+  state.players[1] = newPlayer(winnerIsHost ? remote.guestName : remote.hostName);
+  state.players[0].profession = winnerIsHost ? remote.hostProf : remote.guestProf;
+  state.players[1].profession = winnerIsHost ? remote.guestProf : remote.hostProf;
   const bonusType = RESOURCE_TYPES[Math.floor(Math.random()*RESOURCE_TYPES.length)];
   state.players[1].resources[bonusType] += 1;
-  state.players[0].profession = profs[winnerIdx];
-  state.players[1].profession = profs[loserIdx];
   state.specialTiles = generateSpecialTiles();
   state.architectDiscountMap = generateArchitectDiscountMap();
   state.phase = 'playing';
   state.current = 0;
-  addLog(`${state.players[0].name}(${PROFESSIONS[profs[winnerIdx]].name})と${state.players[1].name}(${PROFESSIONS[profs[loserIdx]].name})の村づくりがはじまった！`);
+  state.onlineRouletteActive = true;
+  state.onlineRouletteRevealed = false;
+  addLog(`${state.players[0].name}(${PROFESSIONS[state.players[0].profession].name})と${state.players[1].name}(${PROFESSIONS[state.players[1].profession].name})の村づくりがはじまった！`);
   addLog(`🔔 ${state.players[0].name}が先行になった！`);
   addLog(`🎁 後攻の${state.players[1].name}は開始ボーナスで ${RES_ICON[bonusType]}+1 をもらった`);
   state.startBonusCelebration = {winnerIdx:0, loserIdx:1, bonusType};
@@ -1532,11 +1558,24 @@ async function startOnlineGameAsHost(remote){
 function applyRemoteGameState(remote){
   const oldBoard = state.board ? state.board.slice() : [];
   const oldCurrent = state.current;
+  const isFirstOnlineSync = !state.onlineMode;
   const localOnly = {};
   ONLINE_LOCAL_ONLY_KEYS.forEach(k => { localOnly[k] = state[k]; });
   Object.assign(state, remote);
   Object.assign(state, localOnly);
   state.onlineMode = true;
+  // The real first/second-mover slot was decided by a coin flip on the host's device
+  // (see startOnlineGameAsHost) and reaches us here only once it syncs over as
+  // hostPlayerIdx. Always derive myPlayerIdx from it (rather than the provisional
+  // value set earlier in finalizeCreateRoom/finalizeJoinRoom) so it can never drift
+  // out of sync with which array slot we actually ended up in.
+  if(typeof state.hostPlayerIdx === 'number'){
+    state.myPlayerIdx = state.isHost ? state.hostPlayerIdx : (1 - state.hostPlayerIdx);
+  }
+  if(isFirstOnlineSync){
+    state.onlineRouletteActive = true;
+    state.onlineRouletteRevealed = false;
+  }
   lastPushedStateJSON = JSON.stringify(getSyncableState());
 
   // detect what the opponent did by diffing the board, so the other player can see it clearly
@@ -1635,6 +1674,81 @@ function spinRoulette(){
   }
   step();
 }
+// Online battle version of the same slot-machine reveal. Unlike the local mode,
+// the outcome here is already decided by the time this runs (players[0] is always
+// the winner -- see startOnlineGameAsHost/applyRemoteGameState), so both host and
+// guest independently play a purely-cosmetic spin that lands on the same synced
+// result. Neither device needs to know the other is spinning at the same time.
+function spinOnlineRoulette(){
+  if(state.onlineRouletteRevealed) return;
+  const el = document.getElementById('online-roulette-name');
+  const btn = document.getElementById('online-roulette-btn');
+  if(btn) btn.disabled = true;
+  const names = [state.players[0].name, state.players[1].name];
+  const winnerName = state.players[0].name;
+  const totalTicks = 16;
+  let tick = 0;
+  function step(){
+    if(el) el.textContent = Math.random()<0.5 ? names[0] : names[1];
+    tick++;
+    if(tick < totalTicks){
+      const progress = tick / totalTicks;
+      const delay = 55 + progress*progress*260;
+      setTimeout(step, delay);
+    } else {
+      if(el) el.textContent = winnerName;
+      state.onlineRouletteRevealed = true;
+      render();
+    }
+  }
+  step();
+}
+function closeOnlineRoulette(){
+  state.onlineRouletteActive = false;
+  state.onlineRouletteRevealed = false;
+  render();
+}
+function renderOnlineRoulette(){
+  const revealed = state.onlineRouletteRevealed;
+  const winnerName = state.players[0].name;
+  let confetti = '';
+  if(revealed){
+    for(let i=0;i<16;i++){
+      const left = Math.random()*100;
+      const delay = Math.random()*0.4;
+      const dur = 1.2 + Math.random()*0.9;
+      const emoji = ['🎉','✨','🎲','🌟'][i%4];
+      confetti += `<span class="confetti" style="left:${left}%; animation-duration:${dur}s; animation-delay:${delay}s;">${emoji}</span>`;
+    }
+  }
+  const body = `
+    <div style="text-align:center; padding:10px 0; position:relative; overflow:hidden;">
+      ${confetti}
+      <div style="font-size:15px; font-weight:700; color:var(--wood-dark); margin-bottom:14px;">🔔 先行を決めよう！</div>
+      <div class="slot-machine">
+        <div class="slot-window">
+          <span id="online-roulette-name">${revealed ? winnerName : '？？？'}</span>
+        </div>
+        <div class="slot-lights"><span></span><span></span><span></span><span></span><span></span></div>
+      </div>
+      ${revealed ? `<div class="modal-onomatopoeia" style="margin-top:2px;">ジャジャーン！</div>` : ''}
+      ${!revealed
+        ? `<button id="online-roulette-btn" class="wood-btn gold wide" style="margin-top:10px;" onclick="spinOnlineRoulette()">🔔 決める</button>`
+        : `<div style="font-size:13px; color:var(--wood-dark); margin:10px 0;">${winnerName}が先行だよ！</div>
+           <button class="wood-btn gold wide" onclick="closeOnlineRoulette()">🏘️ むらづくりをはじめる</button>`
+      }
+    </div>
+  `;
+  return `
+    <div class="title-block">
+      <div class="eyebrow">VILLAGE CHRONICLE</div>
+      <h1>🌐 ローカルバトル</h1>
+    </div>
+    <div class="panel">
+      ${body}
+    </div>
+  `;
+}
 function startTestGame(){
   state = freshState();
   state.players[0] = newPlayer('テストA');
@@ -1695,6 +1809,7 @@ function beginTurn(){
   state.exchangeGiveSelected = {wood:0, stone:0, wheat:0, wool:0};
   state.eventBanner = null;
   state.eventModalOpen = false;
+  state.eventAnnounceShown = false;
   state.eventDeltas = null;
   state.eventDestroyed = null;
   state.eventGoldTiles = null;
@@ -1705,6 +1820,8 @@ function beginTurn(){
   const isPlayerFirstTurn = state.players[state.current].turnsPlayed===0;
   if(!isPlayerFirstTurn && Math.random() < EVENT_CHANCE){
     const ev = pickWeightedEvent();
+    if(!state.eventOccurredCounts) state.eventOccurredCounts = {};
+    state.eventOccurredCounts[ev.name] = (state.eventOccurredCounts[ev.name] || 0) + 1;
     state.eventType = ev.type;
     state.eventEmoji = ev.emoji;
     if(ev.resultType==='reloc'){
@@ -2455,6 +2572,10 @@ function setTutorialTab(key){
   state.tutorialTab = key;
   render();
 }
+function dismissEventAnnounce(){
+  state.eventAnnounceShown = true;
+  render();
+}
 function closeEventModal(){
   state.eventModalOpen = false;
   syncAllDisplayResources();
@@ -2594,7 +2715,7 @@ function renderOnlineSetup(){
       <div style="text-align:center;">
         <div style="font-size:14px; color:var(--wood-dark); margin-bottom:10px;">この部屋コードを友達に伝えてね</div>
         <div style="font-family:'Zen Maru Gothic'; font-size:36px; font-weight:900; letter-spacing:.15em; color:var(--gold); background:#3a2a08; border-radius:12px; padding:16px; margin-bottom:14px;">${state.roomCode||'----'}</div>
-        <div class="cpu-thinking" style="animation:cpuPulse 1.4s ease-in-out infinite;">🌐 友達が入ってくるのを待ってます...</div>
+        <div class="cpu-thinking" style="animation:cpuPulse 1.4s ease-in-out infinite; color:var(--wood-dark);">🌐 友達が入ってくるのを待ってます...</div>
         <button class="wood-btn small" style="margin-top:12px;" onclick="backToHomeFromOnline()">やめる</button>
       </div>
     `;
@@ -2630,7 +2751,7 @@ function renderOnlineSetup(){
   } else if(step==='guest-waiting'){
     body = `
       <div style="text-align:center;">
-        <div class="cpu-thinking" style="animation:cpuPulse 1.4s ease-in-out infinite;">🌐 むらづくりが始まるのを待ってます...</div>
+        <div class="cpu-thinking" style="animation:cpuPulse 1.4s ease-in-out infinite; color:var(--wood-dark);">🌐 むらづくりが始まるのを待ってます...</div>
         <button class="wood-btn small" style="margin-top:12px;" onclick="backToHomeFromOnline()">やめる</button>
       </div>
     `;
@@ -2935,7 +3056,7 @@ function renderBuildPanel(){
   if(state.selectedBuild){
     const selB = state.selectedBuild.isProduction ? PRODUCTION_BUILDINGS[state.selectedBuild.key] : POINT_BUILDINGS[state.selectedBuild.key];
     if(selB.effectText){
-      html += `<div class="hint-text">⚡${selB.name}の効果: ${selB.effectText}</div>`;
+      html += `<div class="effect-callout">⚡<b>${selB.name}の効果</b><br>${selB.effectText}</div>`;
     }
     html += `<div class="hint-text">↓ 盤面の空いているマスをタップ。自分の建物のとなりだと+1pt</div>`;
   }
@@ -3035,6 +3156,22 @@ function cellLabel(idx){
   return `${row}行${col}列`;
 }
 
+function renderEventAnnounce(){
+  // A brief "something happened!" flash shown before the detailed event modal, so
+  // the reveal has a beat of suspense instead of dumping all the details at once.
+  // The good/bad border color is shown as a subtle hint, but the emoji/name/effects
+  // stay hidden until the player taps through to renderEventModal().
+  const type = state.eventType;
+  return `
+    <div class="overlay">
+      <div class="modal event-modal ${type}" style="cursor:pointer; text-align:center;" onclick="dismissEventAnnounce()">
+        <div class="event-emoji-big">❗</div>
+        <div class="modal-onomatopoeia" style="font-size:28px;">イベント発生！</div>
+        <button class="wood-btn gold wide" style="margin-top:12px;" onclick="dismissEventAnnounce()">👀 見てみる</button>
+      </div>
+    </div>
+  `;
+}
 function renderEventModal(){
   const type = state.eventType;
 
@@ -3636,29 +3773,39 @@ function renderGoldBonusModal(){
 function render(){
   recalcPoints();
   const app = document.getElementById('app');
+  // The building picker (.palette) scrolls horizontally, and app.innerHTML gets
+  // fully replaced on every render(). Without this, tapping a card scrolled off to
+  // the right (to see its "⚡特殊" effect) would snap the whole strip back to the
+  // start on every re-render, making the card you just tapped jump out of view.
+  const paletteEl = document.querySelector('.palette');
+  const savedPaletteScrollLeft = paletteEl ? paletteEl.scrollLeft : null;
   app.setAttribute('data-phase', state.phase);
   document.body.style.overflow = '';
   document.documentElement.style.overflow = '';
   let html;
+  const showingOnlineRoulette = state.phase==='playing' && state.onlineMode && state.onlineRouletteActive;
   if(state.phase==='setup') html = renderSetup();
   else if(state.phase==='onlineSetup') html = renderOnlineSetup();
+  else if(showingOnlineRoulette) html = renderOnlineRoulette();
   else if(state.phase==='playing') html = renderPlaying();
   else { html = renderFinished(); submitFinishedScores(); }
-  if(state.showRanking) html += renderRankingModal();
-  if(state.endTurnConfirmOpen) html += renderEndTurnConfirmModal();
-  if(state.startBonusCelebration) html += renderStartBonusModal();
-  if(state.goldBonusCelebration) html += renderGoldBonusModal();
-  if(state.fortStealCelebration) html += renderFortStealModal();
-  if(state.monumentCelebration) html += renderMonumentModal();
-  if(state.soldOutCelebration) html += renderSoldOutModal();
-  if(state.productionCelebration) html += renderProductionModal();
-  if(state.taxPaymentUI) html += renderTaxPaymentModal();
-  if(state.taxCelebration) html += renderTaxModal();
-  if(state.castleCelebration) html += renderCastleModal();
-  if(state.eventModalOpen) html += renderEventModal();
-  if(state.profInfoOpen!==null) html += renderProfInfoModal();
-  if(state.showTutorial) html += renderTutorial();
-  if(state.tourOpen) html += renderTourOverlay();
+  if(!showingOnlineRoulette){
+    if(state.showRanking) html += renderRankingModal();
+    if(state.endTurnConfirmOpen) html += renderEndTurnConfirmModal();
+    if(state.startBonusCelebration) html += renderStartBonusModal();
+    if(state.goldBonusCelebration) html += renderGoldBonusModal();
+    if(state.fortStealCelebration) html += renderFortStealModal();
+    if(state.monumentCelebration) html += renderMonumentModal();
+    if(state.soldOutCelebration) html += renderSoldOutModal();
+    if(state.productionCelebration) html += renderProductionModal();
+    if(state.taxPaymentUI) html += renderTaxPaymentModal();
+    if(state.taxCelebration) html += renderTaxModal();
+    if(state.castleCelebration) html += renderCastleModal();
+    if(state.eventModalOpen) html += (state.eventAnnounceShown ? renderEventModal() : renderEventAnnounce());
+    if(state.profInfoOpen!==null) html += renderProfInfoModal();
+    if(state.showTutorial) html += renderTutorial();
+    if(state.tourOpen) html += renderTourOverlay();
+  }
 
   if(state.phase==='playing'){
     const seasonIdx = sharedSeasonBaseIdx();
@@ -3668,6 +3815,10 @@ function render(){
     document.body.className = '';
   }
   app.innerHTML = html;
+  if(savedPaletteScrollLeft !== null){
+    const newPaletteEl = document.querySelector('.palette');
+    if(newPaletteEl) newPaletteEl.scrollLeft = savedPaletteScrollLeft;
+  }
   scheduleOnlinePush();
 }
 
