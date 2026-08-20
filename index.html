@@ -693,7 +693,7 @@ const ONLINE_LOCAL_ONLY_KEYS = [
   'onlineRouletteActive','onlineRouletteRevealed'
 ];
 
-const APP_VERSION = 'v2026.08.20-9';
+const APP_VERSION = 'v2026.08.20-10';
 
 // ---------- remembered player name (per device) ----------
 const PLAYER_NAME_KEY = 'villageBuilderPlayerName';
@@ -1625,7 +1625,10 @@ function applyRemoteGameState(remote){
   // that are new since oldLogHead. Any remote update that reaches this point already
   // passed the echo filter in handleRemoteRoomUpdate (own pushes are skipped), so any
   // new log entries here represent genuine opponent actions -- builds, exchanges,
-  // production income, tax, events, fort steals, all already have addLog() messages.
+  // tax, events, fort steals, all already have addLog() messages. Production income
+  // ("○○の生産: ...") is deliberately excluded from this popup -- it fires on every
+  // single turn end (even "なし"), so surfacing it here was just noise; it's still
+  // recorded in the persistent 村の記録 log panel for anyone who wants to check it.
   function showOpponentNarration(){
     if(state.myPlayerIdx===null || !state.log || !state.log.length || oldLogHead===null) return;
     const newEntries = [];
@@ -1633,9 +1636,10 @@ function applyRemoteGameState(remote){
       if(state.log[i]===oldLogHead) break;
       newEntries.push(state.log[i]);
     }
-    if(newEntries.length){
-      newEntries.reverse(); // oldest of the newly-seen entries first, matches the order they happened in
-      state.onlineOpponentActionText = '🌐 ' + newEntries.join(' / ');
+    const displayEntries = newEntries.filter(msg => !msg.includes('の生産:'));
+    if(displayEntries.length){
+      displayEntries.reverse(); // oldest of the newly-seen entries first, matches the order they happened in
+      state.onlineOpponentActionText = '🌐 ' + displayEntries.join(' / ');
       render();
       clearTimeout(window.__onlineActionTimer);
       const showMs = 2600 + newEntries.length * 1600; // give longer combos more time to read
